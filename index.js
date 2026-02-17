@@ -35,6 +35,15 @@ server.listen(port, () => {
 });
 
 
+// --- GLOBAL ERROR HANDLERS (Prevent Crash) ---
+process.on('uncaughtException', (err) => {
+    console.error('CRITICAL ERROR (Uncaught):', err);
+    // Keep alive if possible, or exit gracefully
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('CRITICAL ERROR (Unhandled Rejection):', reason);
+});
+
 // Initialize WhatsApp Client
 const client = new Client({
     authStrategy: new LocalAuth(),

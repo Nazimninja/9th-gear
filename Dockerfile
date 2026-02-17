@@ -1,4 +1,4 @@
-FROM node:18
+FROM node:20
 
 # 1. Install dependencies for Chromium (Puppeteer)
 RUN apt-get update && apt-get install -y \
