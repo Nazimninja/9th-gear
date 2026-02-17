@@ -93,42 +93,101 @@ client.on('message', async (message) => {
 
         response = await getAIResponse(userId, body, userState);
 
-        // Capture Location & Qualify Lead
-        // The Prompt now enforces asking for Location FIRST.
-        // So the first real user response (Step 0 -> 1) is likely the location.
-        if (userState.step === 0) {
-            userState.step = 1;
-            userState.location = body;
+        // --- GLOBAL LOCATION MONITOR ---
+        // Check EVERY message for location keywords until we have logged them.
 
-            // CHECK LOCATION QUALIFICATION
+        if (!userState.hasLogged) {
             const karnatakaKeywords = ['bangalore', 'bengaluru', 'karnataka', 'mysore', 'mangalore', 'whitefield', 'indiranagar', 'koramangala', 'hsr', 'jayanagar', 'jp nagar', 'sadashivanagar', 'yes', 'blr'];
             const isQualified = karnatakaKeywords.some(loc => body.toLowerCase().includes(loc));
 
-            if (isQualified) {
+            // Log ALL leads, but mark status differently
+            // We assume if they are replying to us, they are interested.
+            // But we try to be smart: Only log if it looks like a location OR if we are in Step 1 (Location Phase).
+
+            const isLocationPhase = (userState.step === 1);
+            const hasLocationKeyword = isQualified || ['mumbai', 'delhi', 'chennai', 'hyderabad', 'pune', 'city', 'town'].some(w => body.toLowerCase().includes(w));
+
+            if (isQualified || isLocationPhase || hasLocationKeyword) {
                 try {
-                    console.log(`[Main] Qualified Location (${body}). Logging to Sheets...`);
+                    const status = isQualified ? "Qualified Lead" : "Lead (d)";
+                    console.log(`[Main] Lead Detected (${status}): "${body}". Logging to Sheets...`);
+
                     await appendToSheet({
                         date: new Date().toISOString(),
                         name: message._data.notifyName || "Unknown",
                         phone: userId.replace('@c.us', ''),
-                        vehicle: "Pending (Asking)",
+                        vehicle: userState.vehicleInterest || "Pending",
                         location: body,
-                        status: "Qualified Lead"
+                        status: status
                     });
-                    console.log("[Main] Successfully logged QUALIFIED lead.");
+                    console.log("[Main] Successfully logged lead.");
+
+                    userState.hasLogged = true;
+                    userState.location = body;
+                    userState.step = 2; // Move to Car Enquiry
+                    updateState(userId, userState);
+
                 } catch (e) {
                     console.error("[Main] Sheet Logging Failed:", e.message);
                 }
-            } else {
-                console.log(`[Main] User location (${body}) not in Karnataka list. NOT logging to Sheets.`);
             }
+        }
+
+        // --- STEP MANAGEMENT (For AI Context) ---
+        if (userState.step === 0) {
+            userState.step = 1; // Moved from Init -> Asking Location
             updateState(userId, userState);
-        } else if (userState.step === 1) {
-            // Step 1 -> 2: They are giving Car Requirement
+        } else if (userState.step === 1 && userState.hasLogged) {
             userState.step = 2;
+            updateState(userId, userState);
+        } else if (userState.step === 2) {
             userState.vehicleInterest = body;
             updateState(userId, userState);
         }
+
+        // --- HUMAN-LIKE DELAY LOGIC ---
+        // Calculate delay based on response type to simulate thinking/typing.
+
+        const chat = await message.getChat();
+        let delayMs = 2000; // Default min
+
+        // 1. Analyze Response Complexity
+        if (response) {
+            const length = response.length;
+            const hasLink = response.includes('http');
+            const isPrice = response.includes('₹') || response.toLowerCase().includes('price') || response.toLowerCase().includes('lakh');
+
+            // Base typing speed: ~50ms per character (adjust for realism)
+            // Short (hi): 2-4s
+            // Medium (details): 5-8s
+            // Long (links/price): 8-12s+
+
+            if (length < 50) {
+                delayMs = Math.floor(Math.random() * (4000 - 2000 + 1) + 2000); // 2-4s
+            } else if (length < 150) {
+                delayMs = Math.floor(Math.random() * (8000 - 5000 + 1) + 5000); // 5-8s
+            } else {
+                delayMs = Math.floor(Math.random() * (12000 - 8000 + 1) + 8000); // 8-12s
+            }
+
+            // Special "Thinking" Pause for Price/Visit Intent (The "Trust Builder")
+            // Playbook Rule: 10-15s for sensitive topics
+            if (hasLink || isPrice) {
+                // Ensure total is between 10-15s
+                const currentMax = delayMs;
+                const needed = 10000 - currentMax;
+                if (needed > 0) delayMs += needed + Math.floor(Math.random() * 5000);
+            }
+        }
+
+        // 2. Send "Typing..." Indicator
+        try {
+            await chat.sendStateTyping();
+        } catch (e) { } // Ignore if fails
+
+        // 3. Wait for the calculated delay
+        console.log(`[Human Delay] Waiting ${delayMs}ms before sending...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
 
         // Send Response
         if (response) {

@@ -8,10 +8,27 @@ async function appendToSheet(data) {
             return;
         }
 
-        const auth = new google.auth.GoogleAuth({
-            keyFile: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+        const authOptions = {
             scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-        });
+        };
+
+        // Support for Cloud Deployment (Railway/Render) where we pass JSON string
+        if (process.env.GOOGLE_CREDENTIALS_JSON) {
+            try {
+                authOptions.credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+            } catch (jsonErr) {
+                console.error("Failed to parse GOOGLE_CREDENTIALS_JSON:", jsonErr.message);
+            }
+        }
+        // Fallback to local file
+        else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+            authOptions.keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+        } else {
+            console.warn("No Google Sheets credentials found (File or JSON).");
+            return;
+        }
+
+        const auth = new google.auth.GoogleAuth(authOptions);
         const client = await auth.getClient();
         const email = client.email || (await auth.getCredentials()).client_email;
         console.log(`[Sheets] Authenticated as: ${email}`);

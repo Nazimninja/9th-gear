@@ -1,35 +1,61 @@
-// In-memory store (Replace with DB for production persistence)
-const userStates = {};
-const handoffTimers = {};
+const fs = require('fs');
+const path = require('path');
+
+const DB_PATH = path.join(__dirname, '../data/user_db.json');
+
+// Memory Cache
+let userStates = {};
+let handoffTimers = {};
+
+// Load DB on Init
+try {
+    if (fs.existsSync(DB_PATH)) {
+        const raw = fs.readFileSync(DB_PATH);
+        userStates = JSON.parse(raw);
+        console.log(`[State] Loaded ${Object.keys(userStates).length} user sessions from disk.`);
+    }
+} catch (e) {
+    console.error("[State] Failed to load DB:", e.message);
+}
+
+function saveDB() {
+    try {
+        fs.writeFileSync(DB_PATH, JSON.stringify(userStates, null, 2));
+    } catch (e) {
+        console.error("[State] Failed to save DB:", e.message);
+    }
+}
 
 function getOrInitState(userId) {
     if (!userStates[userId]) {
         userStates[userId] = {
-            step: 0, // 0 = Idle, 1 = Vehicle Asked, 2 = Location Asked, 3 = Qualified
+            step: 0, // 0 = Idle, 1 = Location Asked, 2 = Car Asked
             vehicleInterest: null,
             location: null,
             status: "New",
-            history: []
+            history: [],
+            hasLogged: false,
+            lastSeen: Date.now()
         };
+        saveDB();
     }
     return userStates[userId];
 }
 
 function updateState(userId, newData) {
     if (!userStates[userId]) return;
-    userStates[userId] = { ...userStates[userId], ...newData };
+    userStates[userId] = { ...userStates[userId], ...newData, lastSeen: Date.now() };
+    saveDB(); // Persist on every update
 }
 
 function setHandoff(userId, durationMs) {
-    // Clear existing timer if any
     if (handoffTimers[userId]) clearTimeout(handoffTimers[userId]);
 
-    // Set handoff active
     if (!userStates[userId]) getOrInitState(userId);
     userStates[userId].handoffActive = true;
     userStates[userId].handoffUntil = Date.now() + durationMs;
+    saveDB();
 
-    // Auto-resume after duration
     handoffTimers[userId] = setTimeout(() => {
         resetHandoff(userId);
     }, durationMs);
@@ -37,21 +63,22 @@ function setHandoff(userId, durationMs) {
 
 function isHandedOff(userId) {
     if (!userStates[userId]) return false;
-    if (userStates[userId].handoffActive && Date.now() < userStates[userId].handoffUntil) {
-        return true;
+
+    // Check expired
+    if (userStates[userId].handoffActive && Date.now() > userStates[userId].handoffUntil) {
+        resetHandoff(userId); // Auto-reset
+        return false;
     }
-    // If time expired, reset automatically
-    if (userStates[userId].handoffActive) {
-        resetHandoff(userId);
-    }
-    return false;
+
+    return userStates[userId].handoffActive;
 }
 
 function resetHandoff(userId) {
     if (userStates[userId]) {
         userStates[userId].handoffActive = false;
         userStates[userId].handoffUntil = null;
-        console.log(`Re-enabling AI for ${userId}`);
+        console.log(`[State] Re-enabling AI for ${userId}`);
+        saveDB();
     }
 }
 
