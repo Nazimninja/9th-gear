@@ -70,6 +70,11 @@ const client = new Client({
 client.on('qr', (qr) => {
     console.log('Scan this QR code with WhatsApp:');
     qrcode.generate(qr, { small: true });
+
+    console.log('\n--- IF SCANNING FAILS ---');
+    console.log('Copy the code below and paste it into: https://www.the-qrcode-generator.com/');
+    console.log(qr);
+    console.log('-------------------------\n');
 });
 
 client.on('ready', () => {
