@@ -22,6 +22,19 @@ require('dotenv').config();
     }
 })();
 
+// --- RAILWAY KEEP-ALIVE SERVER ---
+// Railway requires the app to listen on a port, or it kills it.
+const http = require('http');
+const port = process.env.PORT || 8080;
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Nazim (9th Gear AI) is Running! 🚀\n');
+});
+server.listen(port, () => {
+    console.log(`[Server] Keep-alive server listening on port ${port}`);
+});
+
+
 // Initialize WhatsApp Client
 const client = new Client({
     authStrategy: new LocalAuth(),
