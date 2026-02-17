@@ -1,0 +1,13 @@
+node_modules
+.env
+.wwebjs_auth
+session
+.git
+.gitignore
+Dockerfile
+README.md
+task.md
+walkthrough.md
+implementation_plan.md
+run_agent.bat
+*.log
