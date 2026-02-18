@@ -2,8 +2,14 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const businessInfo = require('../config/businessInfo');
 require('dotenv').config();
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+const model = process.env.GEMINI_API_KEY ? genAI.getGenerativeModel({ model: "gemini-1.5-flash" }) : null;
+
+if (!process.env.GEMINI_API_KEY) {
+    console.error("❌ CRITICAL: GEMINI_API_KEY is missing in Environment Variables!");
+} else {
+    console.log("✅ Gemini API Key found. Model initialized.");
+}
 
 async function getAIResponse(userId, messageBody, userState) {
     try {
@@ -34,23 +40,30 @@ async function getAIResponse(userId, messageBody, userState) {
         let retries = 3;
         while (retries > 0) {
             try {
+                if (!model) throw new Error("Gemini Model not initialized (Check API Key)");
+
                 const result = await model.generateContent(prompt);
                 const response = await result.response;
                 return response.text();
             } catch (error) {
-                const isRateLimit = error.message.includes('429') || error.message.includes('Quota') || error.message.includes('503');
-                console.error(`Gemini API Error (Attempts left: ${retries - 1}):`, isRateLimit ? "Rate Limit/Quota Hit" : error.message);
+                const mapError = (e) => {
+                    if (e.message.includes('429')) return "Rate Limit";
+                    if (e.message.includes('Quota')) return "Quota Exceeded";
+                    if (e.message.includes('503')) return "Service Unavailable";
+                    return e.message;
+                };
 
-                if (retries === 1) throw error; // Throw on last attempt
+                console.error(`Gemini API Error (Attempt ${4 - retries}):`, mapError(error));
+
+                if (retries === 1) throw error;
                 retries--;
-                // Wait longer if it's a rate limit (4s, 8s, etc.)
-                const delay = isRateLimit ? 4000 * (4 - retries) : 2000;
+                const delay = error.message.includes('429') ? 4000 * (4 - retries) : 2000;
                 await new Promise(resolve => setTimeout(resolve, delay));
             }
         }
 
     } catch (error) {
-        console.error("Gemini API Final Error:", error);
+        console.error("❌ Gemini API Fatal Error:", error.message, error.stack);
         return "I'm checking that for you... just a moment. (Network busy, please type 'Hi' again)";
     }
 }
