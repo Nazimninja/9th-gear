@@ -60,7 +60,14 @@ const client = new Client({
             '--no-first-run',
             '--no-zygote',
             '--disable-gpu',
-            '--disable-features=site-per-process'
+            '--disable-features=site-per-process',
+            '--no-default-browser-check',
+            '--no-first-run',
+            '--disable-default-apps',
+            '--disable-extensions',
+            '--disable-component-extensions-with-background-pages',
+            '--disable-notifications',
+            '--mute-audio'
         ]
     }
 });
