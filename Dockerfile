@@ -28,6 +28,9 @@ RUN npm install
 # 6. Copy app source
 COPY . .
 
-# 7. Start the bot
+# 7. Create data directory for persistence (Fixes ENOENT crash)
+RUN mkdir -p /usr/src/app/data
+
+# 8. Start the bot
 CMD [ "node", "index.js" ]
 
