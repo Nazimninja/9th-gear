@@ -3,7 +3,8 @@ const businessInfo = require('../config/businessInfo');
 require('dotenv').config();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
-const model = process.env.GEMINI_API_KEY ? genAI.getGenerativeModel({ model: "gemini-pro" }) : null;
+// Verified Available Model via HTTP Check: gemini-2.0-flash
+const model = process.env.GEMINI_API_KEY ? genAI.getGenerativeModel({ model: "gemini-2.0-flash" }) : null;
 
 if (!process.env.GEMINI_API_KEY) {
     console.error("❌ CRITICAL: GEMINI_API_KEY is missing in Environment Variables!");
