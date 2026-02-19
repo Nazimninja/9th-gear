@@ -113,33 +113,43 @@ client.on('message', async (message) => {
     // 3. Process User Message
     try {
         console.log(`Received message from ${userId}: ${body}`);
+        const chat = await message.getChat();
 
-        // Retrieve/Init User State
+        // --- FETCH REAL HISTORY (Memory Fix) ---
+        // Instead of relying on a JSON file that gets wiped, we ask WhatsApp for the chat history.
+        // This ensures the bot KNOWS if it already said "Hi, Nazim here".
+
+        let history = [];
+        try {
+            const fetchedMessages = await chat.fetchMessages({ limit: 15 });
+            history = fetchedMessages.map(msg => ({
+                role: msg.fromMe ? "Nazim" : "User",
+                content: msg.body
+            }));
+            // Append current message if not yet in history (it usually is, but just in case)
+            if (history.length === 0 || history[history.length - 1].content !== body) {
+                history.push({ role: "User", content: body });
+            }
+        } catch (histErr) {
+            console.error("Failed to fetch chat history:", histErr);
+            history = [{ role: "User", content: body }]; // Fallback
+        }
+
+        // Retrieve/Init User State (Just for Sheet Logging/Phase tracking, NOT for history)
         let userState = getOrInitState(userId);
 
-        // Add User Message to History
-        userState.history.push({ role: "User", content: body });
-        if (userState.history.length > 10) userState.history.shift(); // Keep last 10
-
         let response;
-
         // -- AI Logic --
-        // We pass the whole state + history to the AI.
-        // We still use 'step' tracking just for logging data (Sheets), but we let the AI handle the conversation flow.
+        // Pass the REAL history to the AI.
+        // We temporarily attach history to userState just for the function call, or specific arg
+        userState.history = history;
 
         response = await getAIResponse(userId, body, userState);
 
         // --- GLOBAL LOCATION MONITOR ---
-        // Check EVERY message for location keywords until we have logged them.
-
         if (!userState.hasLogged) {
             const karnatakaKeywords = ['bangalore', 'bengaluru', 'karnataka', 'mysore', 'mangalore', 'whitefield', 'indiranagar', 'koramangala', 'hsr', 'jayanagar', 'jp nagar', 'sadashivanagar', 'yes', 'blr'];
             const isQualified = karnatakaKeywords.some(loc => body.toLowerCase().includes(loc));
-
-            // Log ALL leads, but mark status differently
-            // We assume if they are replying to us, they are interested.
-            // But we try to be smart: Only log if it looks like a location OR if we are in Step 1 (Location Phase).
-
             const isLocationPhase = (userState.step === 1);
             const hasLocationKeyword = isQualified || ['mumbai', 'delhi', 'chennai', 'hyderabad', 'pune', 'city', 'town'].some(w => body.toLowerCase().includes(w));
 
@@ -159,78 +169,42 @@ client.on('message', async (message) => {
                     console.log("[Main] Successfully logged lead.");
 
                     userState.hasLogged = true;
-                    userState.location = body;
-                    userState.step = 2; // Move to Car Enquiry
+                    userState.step = 2;
                     updateState(userId, userState);
 
                 } catch (e) {
-                    console.error("[Main] Sheet Logging Failed:", e.message);
+                    console.error("❌ [Main] Sheet Logging Failed:", e.message);
                 }
             }
         }
 
-        // --- STEP MANAGEMENT (For AI Context) ---
+        // --- STEP MANAGEMENT ---
         if (userState.step === 0) {
-            userState.step = 1; // Moved from Init -> Asking Location
+            userState.step = 1;
             updateState(userId, userState);
         } else if (userState.step === 1 && userState.hasLogged) {
             userState.step = 2;
             updateState(userId, userState);
-        } else if (userState.step === 2) {
-            userState.vehicleInterest = body;
-            updateState(userId, userState);
         }
 
         // --- HUMAN-LIKE DELAY LOGIC ---
-        // Calculate delay based on response type to simulate thinking/typing.
-
-        const chat = await message.getChat();
-        let delayMs = 2000; // Default min
-
-        // 1. Analyze Response Complexity
+        let delayMs = 2000;
         if (response) {
             const length = response.length;
-            const hasLink = response.includes('http');
-            const isPrice = response.includes('₹') || response.toLowerCase().includes('price') || response.toLowerCase().includes('lakh');
-
-            // Base typing speed: ~50ms per character (adjust for realism)
-            // Short (hi): 2-4s
-            // Medium (details): 5-8s
-            // Long (links/price): 8-12s+
-
-            if (length < 50) {
-                delayMs = Math.floor(Math.random() * (4000 - 2000 + 1) + 2000); // 2-4s
-            } else if (length < 150) {
-                delayMs = Math.floor(Math.random() * (8000 - 5000 + 1) + 5000); // 5-8s
-            } else {
-                delayMs = Math.floor(Math.random() * (12000 - 8000 + 1) + 8000); // 8-12s
-            }
-
-            // Special "Thinking" Pause for Price/Visit Intent (The "Trust Builder")
-            // Playbook Rule: 10-15s for sensitive topics
-            if (hasLink || isPrice) {
-                // Ensure total is between 10-15s
-                const currentMax = delayMs;
-                const needed = 10000 - currentMax;
-                if (needed > 0) delayMs += needed + Math.floor(Math.random() * 5000);
-            }
+            if (length < 50) delayMs = Math.floor(Math.random() * 2000) + 2000; // 2-4s
+            else if (length < 150) delayMs = Math.floor(Math.random() * 3000) + 4000; // 4-7s
+            else delayMs = Math.floor(Math.random() * 4000) + 6000; // 6-10s
         }
 
-        // 2. Send "Typing..." Indicator
-        try {
-            await chat.sendStateTyping();
-        } catch (e) { } // Ignore if fails
+        // Send "Typing..." Indicator
+        try { await chat.sendStateTyping(); } catch (e) { }
 
-        // 3. Wait for the calculated delay
         console.log(`[Human Delay] Waiting ${delayMs}ms before sending...`);
         await new Promise(resolve => setTimeout(resolve, delayMs));
 
         // Send Response
         if (response) {
             await client.sendMessage(userId, response);
-            // Add AI Message to History
-            userState.history.push({ role: "Nazim", content: response });
-            if (userState.history.length > 10) userState.history.shift();
         }
 
     } catch (error) {
