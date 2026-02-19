@@ -1,25 +1,25 @@
 const { appendToSheet } = require('./services/sheets');
 require('dotenv').config();
 
-async function testSheets() {
-    console.log("Testing Sheets Integration...");
-    console.log("Spreadsheet ID:", process.env.SPREADSHEET_ID);
-
+(async () => {
+    console.log("Testing Google Sheets Connection...");
     try {
-        const testData = {
+        await appendToSheet({
             date: new Date().toISOString(),
-            name: "Test User",
-            phone: "0000000000",
-            vehicle: "Test Car",
+            name: "Test User (System Check)",
+            phone: "9100000000",
+            vehicle: "Debug Check",
             location: "Test Location",
-            status: "Test Status"
-        };
-
-        const result = await appendToSheet(testData);
-        console.log("Sheet Append Result:", result);
+            status: "System Test"
+        });
+        console.log("✅ SUCCESS: Test row added to Google Sheet.");
     } catch (error) {
-        console.error("Sheet Connection Failed:", error);
+        console.error("❌ FAILURE:", error.message);
+        if (error.message.includes("invalid_grant")) {
+            console.error("  -> Hint: Check your GOOGLE_APPLICATION_CREDENTIALS or System Time.");
+        }
+        if (error.message.includes("404")) {
+            console.error("  -> Hint: Check your SPREADSHEET_ID.");
+        }
     }
-}
-
-testSheets();
+})();
