@@ -8,24 +8,37 @@ async function appendToSheet(data) {
             return;
         }
 
-        const authOptions = {
+        let authOptions = {
             scopes: ['https://www.googleapis.com/auth/spreadsheets'],
         };
 
-        // Support for Cloud Deployment (Railway/Render) where we pass JSON string
-        if (process.env.GOOGLE_CREDENTIALS_JSON) {
+        const googleCreds = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+        // Robust Check: Is it a File Path or JSON Content?
+        if (googleCreds && googleCreds.trim().startsWith('{')) {
+            // It's JSON Content (Cloud Deployment)
             try {
-                authOptions.credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
-            } catch (jsonErr) {
-                console.error("Failed to parse GOOGLE_CREDENTIALS_JSON:", jsonErr.message);
+                authOptions.credentials = JSON.parse(googleCreds);
+            } catch (err) {
+                console.error("❌ Failed to parse GOOGLE_APPLICATION_CREDENTIALS JSON:", err.message);
+                return;
             }
-        }
-        // Fallback to local file
-        else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
-            authOptions.keyFile = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+        } else if (googleCreds) {
+            // It's a File Path (Local)
+            authOptions.keyFile = googleCreds;
         } else {
-            console.warn("No Google Sheets credentials found (File or JSON).");
-            return;
+            // Try explicit JSON env var if available
+            if (process.env.GOOGLE_CREDENTIALS_JSON) {
+                try {
+                    authOptions.credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+                } catch (jsonErr) {
+                    console.error("❌ Failed to parse GOOGLE_CREDENTIALS_JSON:", jsonErr.message);
+                    return;
+                }
+            } else {
+                console.warn("⚠️ No Google Sheets credentials found (File or JSON).");
+                return;
+            }
         }
 
         const auth = new google.auth.GoogleAuth(authOptions);
