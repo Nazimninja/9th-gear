@@ -77,7 +77,7 @@ async function getAIResponse(userId, messageBody, userState) {
 
     } catch (error) {
         console.error("❌ Gemini API Fatal Error:", error.message, error.stack);
-        return "I'm checking that for you... just a moment. (Network busy, please type 'Hi' again)";
+        return "Just a moment, checking that for you.";
     }
 }
 
