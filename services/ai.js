@@ -24,6 +24,11 @@ async function getAIResponse(userId, messageBody, userState) {
 
         const systemInstruction = `${businessInfo.systemPrompt}
 
+        🧠 SOFT SKILLS & ADAPTABILITY:
+        - **Mirroring:** If the user writes short messages, you write short messages. If they differ, match their energy.
+        - **Variety:** Never use the exact same phrase twice in a row (e.g., don't always say "Let me check").
+        - **Empathy:** If they say "Price is high", validate it ("I understand, premium cars do hold value...").
+
         INVENTORY:
         ${vehicleList}
 
@@ -33,24 +38,31 @@ async function getAIResponse(userId, messageBody, userState) {
         Recent User Message: "${messageBody}"
         `;
 
-        let prompt = systemInstruction;
-
         // Context is already in the system prompt. We don't need to force "Tasks" anymore.
         // This allows the natural conversation flow defined in businessInfo.js to take over.
+
+        // Configure for more creativity (Less Robotic)
+        const generationConfig = {
+            temperature: 0.7,
+            maxOutputTokens: 150, // Keep it punchy
+        };
 
         let retries = 3;
         while (retries > 0) {
             try {
                 if (!model) throw new Error("Gemini Model not initialized (Check API Key)");
 
-                const result = await model.generateContent(prompt);
+                const result = await model.generateContent({
+                    contents: [{ role: "user", parts: [{ text: systemInstruction }] }],
+                    generationConfig: generationConfig
+                });
                 const response = await result.response;
                 return response.text();
             } catch (error) {
                 const mapError = (e) => {
                     if (e.message.includes('429')) return "Rate Limit";
                     if (e.message.includes('Quota')) return "Quota Exceeded";
-                    if (e.message.includes('503')) return "Service Unavailable";
+                    if (e.message.includes('503')) return "Service Unavailable (Overloaded)";
                     return e.message;
                 };
 
