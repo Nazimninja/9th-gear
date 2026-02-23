@@ -2,81 +2,114 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 const businessInfo = require('../config/businessInfo');
 require('dotenv').config();
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
-// Verified Available Model via HTTP Check: gemini-2.0-flash
-const model = process.env.GEMINI_API_KEY ? genAI.getGenerativeModel({ model: "gemini-2.0-flash" }) : null;
-
 if (!process.env.GEMINI_API_KEY) {
     console.error("❌ CRITICAL: GEMINI_API_KEY is missing in Environment Variables!");
 } else {
     console.log("✅ Gemini API Key found. Model initialized.");
 }
 
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+
+// Build inventory string for the system prompt
+function buildInventoryText() {
+    return businessInfo.vehicles.map(v =>
+        `- ${v.model} (${v.year}): ${v.price} | ${v.details} | More info: ${v.url}`
+    ).join('\n');
+}
+
 async function getAIResponse(userId, messageBody, userState) {
     try {
-        // Dynamic Inventory
-        const vehicleList = businessInfo.vehicles.map(v =>
-            `- ${v.model} (${v.year}): ${v.price}, ${v.details}, Link: ${v.url}`
-        ).join('\n');
+        if (!process.env.GEMINI_API_KEY) {
+            return "Just a moment, checking that for you.";
+        }
 
-        // Format History
-        const chatHistory = userState.history.map(msg => `${msg.role}: ${msg.content}`).join('\n');
+        // --- BUILD SYSTEM PROMPT ---
+        const systemPrompt = `${businessInfo.systemPrompt}
 
-        const systemInstruction = `${businessInfo.systemPrompt}
+CURRENT INVENTORY (33 cars — use ONLY this for information, do NOT hallucinate cars):
+${buildInventoryText()}
 
-        🧠 SOFT SKILLS & ADAPTABILITY:
-        - **Mirroring:** If the user writes short messages, you write short messages. If they differ, match their energy.
-        - **Variety:** Never use the exact same phrase twice in a row (e.g., don't always say "Let me check").
-        - **Empathy:** If they say "Price is high", validate it ("I understand, premium cars do hold value...").
+IMPORTANT MEMORY RULES:
+- The CONVERSATION HISTORY below shows everything already discussed.
+- DO NOT repeat any question that has already been asked.
+- DO NOT reintroduce yourself if "Nazim here" already appears in history.
+- If the customer mentioned their name, use it.
+- If they mentioned a car preference, remember it and do not ask again.
+- If they mentioned their city, remember it and do not ask again.
+`;
 
-        INVENTORY:
-        ${vehicleList}
+        // --- BUILD PROPER MULTI-TURN CHAT HISTORY ---
+        // Convert WhatsApp history into Gemini's alternating user/model format.
+        // Gemini requires strictly alternating turns: user, model, user, model...
+        const rawHistory = userState.history || [];
 
-        CONVERSATION HISTORY:
-        ${chatHistory}
-        
-        Recent User Message: "${messageBody}"
-        `;
+        // Filter to only messages that have real content
+        const filteredHistory = rawHistory.filter(msg => msg.content && msg.content.trim().length > 0);
 
-        // Context is already in the system prompt. We don't need to force "Tasks" anymore.
-        // This allows the natural conversation flow defined in businessInfo.js to take over.
+        // Build alternating turns — merge consecutive same-role messages
+        const geminiHistory = [];
+        for (const msg of filteredHistory) {
+            const role = msg.role === "Nazim" ? "model" : "user";
+            // If last turn has same role, append to it (Gemini requires strict alternation)
+            if (geminiHistory.length > 0 && geminiHistory[geminiHistory.length - 1].role === role) {
+                geminiHistory[geminiHistory.length - 1].parts[0].text += '\n' + msg.content;
+            } else {
+                geminiHistory.push({ role, parts: [{ text: msg.content }] });
+            }
+        }
 
-        // Configure for more creativity (Less Robotic)
-        const generationConfig = {
-            temperature: 0.7,
-            maxOutputTokens: 150, // Keep it punchy
-        };
+        // Ensure history starts with a user turn (Gemini requirement)
+        while (geminiHistory.length > 0 && geminiHistory[0].role !== 'user') {
+            geminiHistory.shift();
+        }
 
+        // Remove the LAST turn if it's the current message (we'll send it as the live message)
+        // The current user message should NOT be in history — it's sent separately
+        if (geminiHistory.length > 0 && geminiHistory[geminiHistory.length - 1].role === 'user') {
+            geminiHistory.pop();
+        }
+
+        // --- START CHAT SESSION ---
+        const model = genAI.getGenerativeModel({
+            model: "gemini-2.0-flash",
+            systemInstruction: systemPrompt,
+        });
+
+        const chat = model.startChat({
+            history: geminiHistory,
+            generationConfig: {
+                temperature: 0.85,   // Natural & varied, not robotic
+                maxOutputTokens: 250, // Enough for a thoughtful but concise reply
+                topP: 0.9,
+            },
+        });
+
+        // --- SEND THE CURRENT MESSAGE ---
         let retries = 3;
         while (retries > 0) {
             try {
-                if (!model) throw new Error("Gemini Model not initialized (Check API Key)");
-
-                const result = await model.generateContent({
-                    contents: [{ role: "user", parts: [{ text: systemInstruction }] }],
-                    generationConfig: generationConfig
-                });
-                const response = await result.response;
-                return response.text();
+                const result = await chat.sendMessage(messageBody);
+                const text = result.response.text();
+                return text;
             } catch (error) {
-                const mapError = (e) => {
-                    if (e.message.includes('429')) return "Rate Limit";
-                    if (e.message.includes('Quota')) return "Quota Exceeded";
-                    if (e.message.includes('503')) return "Service Unavailable (Overloaded)";
-                    return e.message;
-                };
-
-                console.error(`Gemini API Error (Attempt ${4 - retries}):`, mapError(error));
-
-                if (retries === 1) throw error;
+                const errMsg = error.message || '';
+                if (errMsg.includes('429')) {
+                    console.error(`Gemini Rate Limit. Waiting before retry...`);
+                    await new Promise(r => setTimeout(r, 5000 * (4 - retries)));
+                } else if (errMsg.includes('503')) {
+                    console.error(`Gemini Overloaded. Retrying...`);
+                    await new Promise(r => setTimeout(r, 2000));
+                } else {
+                    console.error(`Gemini API Error:`, errMsg);
+                    throw error;
+                }
                 retries--;
-                const delay = error.message.includes('429') ? 4000 * (4 - retries) : 2000;
-                await new Promise(resolve => setTimeout(resolve, delay));
+                if (retries === 0) throw error;
             }
         }
 
     } catch (error) {
-        console.error("❌ Gemini API Fatal Error:", error.message, error.stack);
+        console.error("❌ Gemini API Fatal Error:", error.message);
         return "Just a moment, checking that for you.";
     }
 }
