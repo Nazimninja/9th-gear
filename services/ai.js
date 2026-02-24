@@ -3,15 +3,17 @@ const businessInfo = require('../config/businessInfo');
 require('dotenv').config();
 
 if (!process.env.GEMINI_API_KEY) {
-    console.error("❌ CRITICAL: GEMINI_API_KEY is missing in Environment Variables!");
+    console.error('❌ CRITICAL: GEMINI_API_KEY is missing!');
 } else {
-    console.log("✅ Gemini API Key found. Model initialized.");
+    console.log('✅ Gemini API Key loaded. Model: gemini-1.5-flash');
 }
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-// Build inventory string for the system prompt
 function buildInventoryText() {
+    if (!businessInfo.vehicles || businessInfo.vehicles.length === 0) {
+        return '(Inventory loading — tell customer you will check and confirm)';
+    }
     return businessInfo.vehicles.map(v =>
         `- ${v.model} (${v.year}): ${v.price} | ${v.details} | More info: ${v.url}`
     ).join('\n');
@@ -20,109 +22,93 @@ function buildInventoryText() {
 async function getAIResponse(userId, messageBody, userState) {
     try {
         if (!process.env.GEMINI_API_KEY) {
-            return "Just a moment, checking that for you.";
+            return "Just a moment, let me check that for you!";
         }
 
-        // --- BUILD SYSTEM PROMPT ---
+        // ── BUILD SYSTEM PROMPT ─────────────────────────────────
         const systemPrompt = `${businessInfo.systemPrompt}
 
-CURRENT INVENTORY (33 cars — use ONLY this for information, do NOT hallucinate cars):
+CURRENT INVENTORY (use ONLY this — do NOT make up cars):
 ${buildInventoryText()}
 
-IMPORTANT MEMORY RULES:
-- The CONVERSATION HISTORY below shows everything already discussed.
-- DO NOT repeat any question that has already been asked.
-- DO NOT reintroduce yourself if "Nazim here" already appears in history.
-- If the customer mentioned their name, use it.
-- If they mentioned a car preference, remember it and do not ask again.
-- If they mentioned their city, remember it and do not ask again.
+MEMORY RULES (read chat history before every reply):
+- Do NOT repeat any question already asked.
+- Do NOT reintroduce yourself if already done.
+- Use the customer's name if known. Don't ask for it again.
+- Remember their car preference and city — never ask twice.
 `;
 
-        // --- BUILD PROPER MULTI-TURN CHAT HISTORY ---
-        // Convert WhatsApp history into Gemini's alternating user/model format.
-        // Gemini requires strictly alternating turns: user, model, user, model...
-        const rawHistory = userState.history || [];
+        // ── BUILD CHAT HISTORY ──────────────────────────────────
+        // Gemini needs strictly alternating user/model turns
+        const rawHistory = (userState.history || []).filter(m => m.content && m.content.trim());
 
-        // Filter to only messages that have real content
-        const filteredHistory = rawHistory.filter(msg => msg.content && msg.content.trim().length > 0);
-
-        // Build alternating turns — merge consecutive same-role messages
         const geminiHistory = [];
-        for (const msg of filteredHistory) {
-            const role = msg.role === "Nazim" ? "model" : "user";
-            // If last turn has same role, append to it (Gemini requires strict alternation)
+        for (const msg of rawHistory) {
+            const role = msg.role === 'Nazim' ? 'model' : 'user';
             if (geminiHistory.length > 0 && geminiHistory[geminiHistory.length - 1].role === role) {
+                // Merge consecutive same-role turns (Gemini doesn't allow them back-to-back)
                 geminiHistory[geminiHistory.length - 1].parts[0].text += '\n' + msg.content;
             } else {
                 geminiHistory.push({ role, parts: [{ text: msg.content }] });
             }
         }
 
-        // Ensure history starts with a user turn (Gemini requirement)
+        // Must start with user turn
         while (geminiHistory.length > 0 && geminiHistory[0].role !== 'user') {
             geminiHistory.shift();
         }
 
-        // Remove the LAST turn if it's the current message (we'll send it as the live message)
-        // The current user message should NOT be in history — it's sent separately
+        // Remove last user turn — we send it as the live message below
         if (geminiHistory.length > 0 && geminiHistory[geminiHistory.length - 1].role === 'user') {
             geminiHistory.pop();
         }
 
-        // --- START CHAT SESSION ---
+        // ── SEND TO GEMINI ──────────────────────────────────────
         const model = genAI.getGenerativeModel({
-            model: "gemini-1.5-flash",
+            model: 'gemini-1.5-flash',
             systemInstruction: systemPrompt,
         });
 
         const chat = model.startChat({
             history: geminiHistory,
             generationConfig: {
-                temperature: 0.95,    // High variety — no two replies should sound the same
-                maxOutputTokens: 280, // Concise WhatsApp replies
+                temperature: 0.9,
+                maxOutputTokens: 300,
                 topP: 0.95,
                 topK: 40,
             },
         });
 
-        // --- SEND THE CURRENT MESSAGE ---
-        // Retry with exponential backoff: 10s, 20s, 30s, 45s, 60s, 90s for 429 rate limits
+        // Retry on 429 / 503 with exponential backoff
         const retryDelays = [10000, 20000, 30000, 45000, 60000, 90000];
-        let attempt = 0;
-        while (attempt <= retryDelays.length) {
+        for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
             try {
                 const result = await chat.sendMessage(messageBody);
-                const text = result.response.text();
-                return text;
+                return result.response.text();
             } catch (error) {
-                const errMsg = error.message || '';
-                if (errMsg.includes('429')) {
-                    if (attempt >= retryDelays.length) {
-                        console.error(`Gemini Rate Limit exhausted after ${attempt} retries. Giving up.`);
-                        throw error;
-                    }
-                    const waitMs = retryDelays[attempt];
-                    console.error(`Gemini Rate Limit (429). Waiting ${waitMs / 1000}s before retry ${attempt + 1}/${retryDelays.length}...`);
+                const msg = error.message || '';
+                const is429 = msg.includes('429');
+                const is503 = msg.includes('503');
+
+                if ((is429 || is503) && attempt < retryDelays.length) {
+                    const waitMs = is503 ? 5000 : retryDelays[attempt];
+                    console.error(`Gemini ${is429 ? '429 Rate Limit' : '503 Overloaded'}. Waiting ${waitMs / 1000}s (retry ${attempt + 1}/${retryDelays.length})...`);
                     await new Promise(r => setTimeout(r, waitMs));
-                } else if (errMsg.includes('503')) {
-                    console.error(`Gemini Overloaded (503). Retrying in 5s...`);
-                    await new Promise(r => setTimeout(r, 5000));
                 } else {
-                    console.error(`Gemini API Error:`, errMsg);
+                    // Non-retryable error or retries exhausted
                     throw error;
                 }
-                attempt++;
             }
         }
 
     } catch (error) {
-        console.error("❌ Gemini API Fatal Error:", error.message);
-        // Human-sounding fallback — pick one randomly so even errors sound natural
+        console.error('❌ Gemini Fatal Error:', error.message);
+        // Natural-sounding fallbacks for when AI is unavailable
         const fallbacks = [
-            "Hey sorry, bit tied up right now. I'll get back to you in a minute!",
-            "Sorry hold on, give me a sec 🙏",
-            "My bad, just a moment — will reply shortly!",
-            "Sorry, just stepped away — back in a bit!"
+            "Hey sorry, give me just a minute 🙏",
+            "My bad, bit tied up — will reply shortly!",
+            "Sorry, just stepped away — back in a sec!",
+            "One moment, checking on that for you!"
         ];
         return fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }

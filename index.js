@@ -11,130 +11,83 @@ const {
     updateState,
     isHandedOff,
     setHandoff,
-    resetHandoff
 } = require('./config/state');
 const businessInfo = require('./config/businessInfo');
 require('dotenv').config();
 
 // ============================================================
-// BOT START TIME — Only process messages received AFTER this moment.
-// This is the PRIMARY fix for duplicate messages on reconnect.
-// WhatsApp delivers old messages again when the bot restarts —
-// we simply reject anything older than our startup timestamp.
+// BOT START TIME — reject messages older than this (anti-duplicate)
 // ============================================================
 const BOT_START_TIME_SECONDS = Math.floor(Date.now() / 1000);
-console.log(`[Boot] Bot started at timestamp: ${BOT_START_TIME_SECONDS}`);
+console.log(`[Boot] Bot started at: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
 
 // ============================================================
-// PERSISTED DEDUP CACHE — Survives restarts (saved to disk)
-// Secondary safety net: even if a message has the same timestamp,
-// we won't process the same message ID twice.
+// DEDUP CACHE — in-memory only (Railway restarts clear it,
+// which is correct — old messages should not be re-processed
+// but the timestamp guard already handles that anyway)
 // ============================================================
-const DEDUP_FILE = path.join(__dirname, 'data', 'processed_ids.json');
-let processedMessageIds = new Set();
-
-function loadDedupCache() {
-    try {
-        if (fs.existsSync(DEDUP_FILE)) {
-            const data = JSON.parse(fs.readFileSync(DEDUP_FILE, 'utf8'));
-            processedMessageIds = new Set(data);
-            console.log(`[Dedup] Loaded ${processedMessageIds.size} processed message IDs from disk.`);
-        }
-    } catch (e) {
-        console.error('[Dedup] Failed to load cache:', e.message);
-    }
-}
-
-function saveDedupCache() {
-    try {
-        const arr = Array.from(processedMessageIds).slice(-500); // Keep latest 500
-        fs.writeFileSync(DEDUP_FILE, JSON.stringify(arr));
-    } catch (e) {
-        console.error('[Dedup] Failed to save cache:', e.message);
-    }
-}
+const processedMessageIds = new Set();
 
 function isDuplicate(msgId) {
     if (processedMessageIds.has(msgId)) return true;
     processedMessageIds.add(msgId);
-    // Keep max 500 entries
-    if (processedMessageIds.size > 500) {
-        const firstKey = processedMessageIds.values().next().value;
-        processedMessageIds.delete(firstKey);
+    // Keep last 1000 IDs in memory
+    if (processedMessageIds.size > 1000) {
+        const first = processedMessageIds.values().next().value;
+        processedMessageIds.delete(first);
     }
-    saveDedupCache(); // Persist immediately
     return false;
 }
 
-loadDedupCache();
-
 // ============================================================
-// SERIAL MESSAGE QUEUE — only ONE Gemini call runs at a time.
-// All incoming messages are chained onto this promise so even
-// if 10 people message simultaneously, they process one-by-one.
-// This is the REAL fix for 429 rate limit errors.
+// SERIAL MESSAGE QUEUE — ensures only ONE Gemini call at a time.
+// Prevents 429 rate limits when multiple users message simultaneously.
 // ============================================================
 let messageQueue = Promise.resolve();
-const MIN_GEMINI_INTERVAL_MS = 7000; // safe for 15 RPM (1 per 6s + buffer)
+const GEMINI_CALL_INTERVAL_MS = 6000; // 10 RPM safe gap (1 per 6s)
 let lastGeminiCallTime = 0;
 
 function enqueueMessage(handler) {
-    messageQueue = messageQueue.then(() => handler()).catch(() => { });
+    messageQueue = messageQueue
+        .then(() => handler())
+        .catch(err => console.error('[Queue] Handler error:', err.message));
 }
 
-async function waitForRateLimit() {
-    const now = Date.now();
-    const elapsed = now - lastGeminiCallTime;
-    if (elapsed < MIN_GEMINI_INTERVAL_MS) {
-        const wait = MIN_GEMINI_INTERVAL_MS - elapsed;
-        console.log(`[Queue] Waiting ${wait}ms before next Gemini call...`);
+async function waitForGeminiSlot() {
+    const elapsed = Date.now() - lastGeminiCallTime;
+    if (elapsed < GEMINI_CALL_INTERVAL_MS) {
+        const wait = GEMINI_CALL_INTERVAL_MS - elapsed;
+        console.log(`[Queue] Waiting ${Math.round(wait / 1000)}s for Gemini slot...`);
         await new Promise(r => setTimeout(r, wait));
     }
     lastGeminiCallTime = Date.now();
 }
 
 // ============================================================
-// CLEAN PHONE — use contact's real number (avoids @lid garbage)
+// PHONE NUMBER HELPER
 // ============================================================
 function cleanPhone(rawId) {
-    // Fallback: strip @c.us / @lid etc. and any non-digits
     return rawId.replace(/@.*$/, '').replace(/\D/g, '');
 }
 
 async function getRealPhone(message) {
     try {
         const contact = await message.getContact();
-        // contact.number is the actual phone number WhatsApp gave us
-        if (contact && contact.number) {
-            return contact.number.replace(/\D/g, ''); // digits only
-        }
+        if (contact && contact.number) return contact.number.replace(/\D/g, '');
     } catch (e) {
-        console.log('[Phone] getContact() failed, falling back:', e.message);
+        console.log('[Phone] getContact() failed, using fallback');
     }
-    // Fallback to parsing the userId
     return cleanPhone(message.from);
 }
 
 // ============================================================
-// EXTRACT CAR REQUIREMENT FROM MESSAGE
+// CAR REQUIREMENT EXTRACTOR
 // ============================================================
-const CAR_KEYWORDS = [
-    'car', 'suv', 'sedan', 'hatchback', 'luxury', 'bmw', 'mercedes', 'benz',
-    'audi', 'toyota', 'honda', 'hyundai', 'kia', 'ford', 'tata', 'mahindra',
-    'maruti', 'suzuki', 'volkswagen', 'volvo', 'jeep', 'range rover', 'gle',
-    'glc', 'xc90', 'fortuner', 'innova', 'creta', 'nexon', 'ertiga', 'swift',
-    'pre-owned', 'preowned', 'pre owned', 'used', 'second hand', 'budget',
-    'price', 'lakh', 'lakhs', 'looking for', 'need a', 'want a', 'interested in',
-    '3 series', '5 series', '7 series', 'e class', 'c class', 's class', 'a4', 'a6',
-    '320d', '520d', 'sport line', 'sport'
-];
-
-// ─── SPECIFIC CAR BRANDS / MODELS (must have at least one of these)
 const CAR_BRANDS = [
     'bmw', 'mercedes', 'benz', 'audi', 'toyota', 'honda', 'hyundai', 'kia',
     'ford', 'tata', 'mahindra', 'maruti', 'suzuki', 'volkswagen', 'vw', 'volvo',
     'jeep', 'range rover', 'land rover', 'porsche', 'lexus', 'jaguar', 'skoda',
-    'evoque', 'defender', 'discovery', 'freelander', 'cayenne', 'macan',
+    'mini', 'mini cooper', 'evoque', 'defender', 'discovery', 'cayenne', 'macan',
     'gle', 'glc', 'gla', 'glb', 'e class', 'c class', 's class', 'a class',
     'e200', 'e220', 'c200', 'c220', 'c300',
     '3 series', '5 series', '7 series', 'x1', 'x3', 'x5', 'x7',
@@ -145,13 +98,12 @@ const CAR_BRANDS = [
     'creta', 'nexon', 'harrier', 'safari', 'thar',
     'city', 'civic', 'accord', 'cr-v',
     'celerio', 'baleno', 'brezza', 'ertiga', 'swift',
-    'tucson', 'santa fe', 'veloster', 'elantra',
+    'tucson', 'santa fe', 'elantra',
     'octavia', 'superb', 'kodiaq',
     'endeavour', 'mustang', 'ecosport',
     'bolero', 'xuv', 'xuv500', 'xuv700', 'scorpio'
 ];
 
-// ─── BUYING INTENT PHRASES (signals they actively want to buy)
 const BUYING_PHRASES = [
     'looking for', 'i want', 'i need', 'want to buy', 'planning to buy',
     'interested in', 'searching for', 'i am looking', 'im looking',
@@ -160,21 +112,16 @@ const BUYING_PHRASES = [
 
 function extractRequirement(body) {
     const lower = body.toLowerCase();
-
-    // Must mention a specific brand/model
-    const hasBrand = CAR_BRANDS.some(brand => lower.includes(brand));
-    // OR must have a strong buying intent
-    const hasIntent = BUYING_PHRASES.some(phrase => lower.includes(phrase));
-
+    const hasBrand = CAR_BRANDS.some(b => lower.includes(b));
+    const hasIntent = BUYING_PHRASES.some(p => lower.includes(p));
     if ((hasBrand || hasIntent) && body.length > 3) {
-        // Clean up: limit to 200 chars
         return body.length > 200 ? body.substring(0, 200) + '...' : body;
     }
     return null;
 }
 
 // ============================================================
-// EXTRACT LOCATION FROM MESSAGE
+// LOCATION EXTRACTOR
 // ============================================================
 const BANGALORE_AREAS = [
     'jp nagar', 'hsr layout', 'hsr', 'koramangala', 'indiranagar', 'whitefield',
@@ -185,113 +132,94 @@ const BANGALORE_AREAS = [
     'devanahalli', 'kengeri', 'mysore road', 'tumkur road', 'cunningham road',
     'richmond town', 'langford town', 'cox town', 'frazer town', 'banaswadi',
     'hbr layout', 'kalyan nagar', 'rt nagar', 'ramamurthy nagar', 'mahadevapura',
-    'kr puram', 'tin factory', 'old airport road', 'hal', 'domlur', 'ejipura',
-    'jakkur', 'thanisandra', 'hennur', 'nagawara', 'sahakara nagar', 'sanjaynagar',
-    'mathikere', 'peenya', 'dasarahalli', 'chikkabanavara', 'bangalore', 'bengaluru', 'blr'
+    'kr puram', 'hal', 'domlur', 'ejipura', 'jakkur', 'thanisandra', 'hennur',
+    'nagawara', 'sahakara nagar', 'sanjaynagar', 'mathikere', 'peenya',
+    'dasarahalli', 'bangalore', 'bengaluru', 'blr'
 ];
+const KARNATAKA_CITIES = ['mysore', 'mysuru', 'mangalore', 'mangaluru', 'hubli', 'tumkur'];
+const OTHER_CITIES = ['mumbai', 'delhi', 'chennai', 'hyderabad', 'pune', 'kolkata', 'gurgaon', 'noida'];
 
-const KARNATAKA_CITIES = [
-    'mysore', 'mysuru', 'mangalore', 'mangaluru', 'hubli', 'dharwad',
-    'belgaum', 'bellary', 'tumkur', 'hassan', 'mandya', 'shimoga', 'davangere'
-];
-
-const OTHER_CITIES = [
-    'mumbai', 'delhi', 'chennai', 'hyderabad', 'pune', 'kolkata', 'ahmedabad',
-    'surat', 'jaipur', 'lucknow', 'noida', 'gurgaon'
-];
+function toTitleCase(str) { return str.replace(/\b\w/g, c => c.toUpperCase()); }
 
 function extractLocation(body) {
     const lower = body.toLowerCase();
-    for (const area of BANGALORE_AREAS) {
-        if (lower.includes(area)) return `Bangalore - ${toTitleCase(area)}`;
-    }
-    for (const city of KARNATAKA_CITIES) {
-        if (lower.includes(city)) return toTitleCase(city) + ', Karnataka';
-    }
-    for (const city of OTHER_CITIES) {
-        if (lower.includes(city)) return toTitleCase(city);
-    }
+    for (const a of BANGALORE_AREAS) { if (lower.includes(a)) return `Bangalore - ${toTitleCase(a)}`; }
+    for (const c of KARNATAKA_CITIES) { if (lower.includes(c)) return toTitleCase(c) + ', Karnataka'; }
+    for (const c of OTHER_CITIES) { if (lower.includes(c)) return toTitleCase(c); }
     return null;
 }
 
-function toTitleCase(str) {
-    return str.replace(/\b\w/g, c => c.toUpperCase());
-}
-
-// Initialize Data on Startup
+// ============================================================
+// SCRAPE INVENTORY ON STARTUP
+// ============================================================
 (async () => {
-    const scrapedData = await scrapeBusinessData();
-    if (scrapedData.vehicles.length > 0) {
-        businessInfo.vehicles = scrapedData.vehicles;
-        console.log("Updated businessInfo with live vehicle data.");
+    try {
+        const scrapedData = await scrapeBusinessData();
+        if (scrapedData.vehicles.length > 0) {
+            businessInfo.vehicles = scrapedData.vehicles;
+            console.log(`[Scraper] Loaded ${scrapedData.vehicles.length} vehicles.`);
+        }
+    } catch (e) {
+        console.error('[Scraper] Failed:', e.message);
     }
 })();
 
-// --- RAILWAY HTTP SERVER — serves /qr so you can scan from your phone ---
+// ============================================================
+// HTTP SERVER — keep-alive + /qr endpoint
+// ============================================================
 const http = require('http');
 const port = process.env.PORT || 8080;
-
-let latestQR = null; // stored whenever 'qr' event fires
+let latestQR = null;
 
 const server = http.createServer(async (req, res) => {
     if (req.url === '/qr') {
         if (!latestQR) {
             res.writeHead(200, { 'Content-Type': 'text/html' });
             res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#111;color:#fff">
-<h2>✅ WhatsApp already connected — no QR needed!</h2>
-<p>If the bot just restarted, refresh in a few seconds.</p>
-</body></html>`);
+<h2>✅ WhatsApp already connected!</h2><p>No QR needed. Bot is running.</p></body></html>`);
             return;
         }
         try {
-            const qrImageDataUrl = await QRCode.toDataURL(latestQR, { width: 400, margin: 2 });
+            const qrDataUrl = await QRCode.toDataURL(latestQR, { width: 400, margin: 2 });
             res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(`<!DOCTYPE html>
-<html>
-<head>
-  <title>Scan QR — 9th Gear Bot</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body { margin:0; background:#0d0d0d; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; font-family:sans-serif; color:#fff; }
-    h2 { font-size:1.4rem; margin-bottom:8px; }
-    p  { color:#aaa; font-size:0.9rem; margin-bottom:24px; }
-    img { border-radius:16px; box-shadow:0 0 40px #00e87644; }
-    .note { margin-top:20px; font-size:0.8rem; color:#666; }
-  </style>
-</head>
-<body>
-  <h2>📱 Scan with WhatsApp</h2>
-  <p>Open WhatsApp → Linked Devices → Link a Device</p>
-  <img src="${qrImageDataUrl}" width="300" height="300" />
-  <p class="note">QR expires in ~20 seconds. Refresh if it doesn't scan.</p>
-  <script>setTimeout(()=>location.reload(), 20000);</script>
-</body>
-</html>`);
+            res.end(`<!DOCTYPE html><html>
+<head><title>Scan QR — 9th Gear</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{margin:0;background:#0d0d0d;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;color:#fff}
+h2{margin-bottom:8px}p{color:#aaa;font-size:.9rem;margin-bottom:24px}img{border-radius:16px}
+.note{margin-top:20px;font-size:.8rem;color:#666}</style></head>
+<body><h2>📱 Scan with WhatsApp</h2>
+<p>Open WhatsApp → Linked Devices → Link a Device</p>
+<img src="${qrDataUrl}" width="300" height="300"/>
+<p class="note">QR expires in ~20s. Refreshes automatically.</p>
+<script>setTimeout(()=>location.reload(),18000);</script></body></html>`);
         } catch (e) {
             res.writeHead(500);
-            res.end('QR generation failed: ' + e.message);
+            res.end('QR error: ' + e.message);
         }
         return;
     }
-    // Default keep-alive
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Nazim (9th Gear AI) is Running! 🚀\nVisit /qr to scan the WhatsApp QR code.\n');
+    res.end('9th Gear Bot is Running 🚀\nVisit /qr to scan WhatsApp QR\n');
 });
-server.listen(port, () => {
-    console.log(`[Server] HTTP server on port ${port} — visit /qr to scan QR code`);
-});
+server.listen(port, () => console.log(`[Server] Running on port ${port} — visit /qr for QR code`));
 
-// --- GLOBAL ERROR HANDLERS ---
+// ============================================================
+// GLOBAL ERROR HANDLERS
+// ============================================================
 process.on('uncaughtException', (err) => {
-    console.error('CRITICAL ERROR (Uncaught):', err);
+    console.error('[CRASH] Uncaught Exception:', err.message);
+    // Exit so Railway auto-restarts cleanly with saved session
+    process.exit(1);
 });
 process.on('unhandledRejection', (reason) => {
-    console.error('CRITICAL ERROR (Unhandled Rejection):', reason);
+    console.error('[CRASH] Unhandled Rejection:', reason);
 });
 
-// Initialize WhatsApp Client
+// ============================================================
+// WHATSAPP CLIENT
+// ============================================================
 const client = new Client({
-    authStrategy: new LocalAuth(),
+    authStrategy: new LocalAuth({ dataPath: '/usr/src/app/.wwebjs_auth' }),
     puppeteer: {
         headless: true,
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
@@ -305,11 +233,7 @@ const client = new Client({
             '--single-process',
             '--disable-gpu',
             '--disable-features=site-per-process',
-            '--no-default-browser-check',
-            '--disable-default-apps',
             '--disable-extensions',
-            '--disable-component-extensions-with-background-pages',
-            '--disable-notifications',
             '--disable-background-networking',
             '--disable-sync',
             '--disable-translate',
@@ -324,195 +248,180 @@ const client = new Client({
     }
 });
 
-// QR Code
 client.on('qr', (qr) => {
     latestQR = qr;
-    console.log('\n[QR] Ready — open your Railway public URL + /qr to scan');
+    console.log('\n[QR] New QR generated — open /qr in your browser to scan');
     qrcode.generate(qr, { small: true });
 });
 
 client.on('ready', () => {
     latestQR = null;
-    console.log(`✅ WhatsApp AI Agent is ready!`);
+    console.log('✅ WhatsApp connected and ready!');
 });
 
 client.on('auth_failure', (msg) => {
-    console.error('❌ Auth failure:', msg);
+    console.error('❌ Auth failure — exiting for Railway to restart:', msg);
+    process.exit(1);
 });
 
-// AUTO-RECONNECT: when Puppeteer crashes or WhatsApp disconnects,
-// wait 5s then reinitialize. This is the fix for TargetCloseError.
+// ============================================================
+// DISCONNECT HANDLER — exit cleanly so Railway restarts.
+// LocalAuth saves session to disk, so on restart the bot
+// reconnects WITHOUT needing a new QR scan.
+// ============================================================
 client.on('disconnected', (reason) => {
-    console.warn(`⚠️ WhatsApp disconnected: ${reason}. Reinitializing in 5s...`);
-    latestQR = null;
-    setTimeout(() => {
-        console.log('[Reconnect] Calling client.initialize()...');
-        client.initialize().catch(err => {
-            console.error('[Reconnect] Failed to reinitialize:', err.message);
-        });
-    }, 5000);
+    console.warn(`⚠️ WhatsApp disconnected (${reason}). Exiting — Railway will restart.`);
+    process.exit(1);
 });
 
 // ============================================================
 // MESSAGE HANDLER
 // ============================================================
 client.on('message', async (message) => {
-    // Ignore groups and status — fast check, outside queue
-    if (message.isStatus || message.from.includes('@g.us')) return;
-
-    // Fast pre-checks outside the queue
-    const msgTimestamp = message.timestamp;
-    if (msgTimestamp < BOT_START_TIME_SECONDS) {
-        console.log(`[TimeGuard] Skipping old message (ts: ${msgTimestamp} < bot start: ${BOT_START_TIME_SECONDS})`);
+    // ── FAST FILTERS (outside queue, no cost) ──────────────
+    if (message.isStatus) return;
+    if (message.from.includes('@g.us')) return; // ignore groups
+    if (message.fromMe) {
+        // You replied manually → pause AI for this contact for 30min
+        console.log(`[Handoff] Manual reply to ${message.to} — AI paused 30min`);
+        setHandoff(message.to, 30 * 60 * 1000);
         return;
     }
+
+    // Reject old messages (WhatsApp re-delivers on reconnect)
+    if (message.timestamp < BOT_START_TIME_SECONDS) {
+        console.log(`[TimeGuard] Skipping old message from ${message.from}`);
+        return;
+    }
+
+    // Dedup — skip if already processed
     if (isDuplicate(message.id._serialized)) {
-        console.log(`[Dedup] Skipping already-processed: ${message.id._serialized}`);
+        console.log(`[Dedup] Skipping duplicate: ${message.id._serialized}`);
         return;
     }
 
-    // Push ALL actual processing into the serial queue
-    // Only ONE message is processed at a time — prevents parallel 429s
+    const body = message.body ? message.body.trim() : '';
+    if (!body) return; // skip media-only messages
+
+    const userId = message.from;
+
+    // ── QUEUE: process one message at a time ───────────────
     enqueueMessage(async () => {
-
-        if (isDuplicate(message.id._serialized)) {
-            console.log(`[Dedup] Skipping already-processed: ${message.id._serialized}`);
-            return;
-        }
-
-        const userId = message.from;
-        const body = message.body ? message.body.trim() : '';
-        if (!body) return; // Skip empty/media-only messages
-
-        // 1. Human Handoff
-        if (message.fromMe) {
-            console.log(`Host replied to ${message.to}. Pausing AI.`);
-            setHandoff(message.to, 30 * 60 * 1000);
-            return;
-        }
-
-        // 2. Check if AI is paused
         if (isHandedOff(userId)) {
-            console.log(`AI paused for ${userId}. Ignoring.`);
+            console.log(`[Handoff] AI paused for ${userId}, skipping.`);
             return;
         }
 
         try {
-            // ✅ Get REAL phone number from WhatsApp contact (not the @lid internal hash)
             const phone = await getRealPhone(message);
             const name = message._data?.notifyName
                 || message._data?.pushName
                 || message.notifyName
                 || 'Unknown';
 
-            console.log(`📩 [${new Date().toLocaleTimeString('en-IN')}] From ${name} (${phone}): ${body}`);
+            console.log(`📩 [${new Date().toLocaleTimeString('en-IN')}] ${name} (${phone}): ${body}`);
 
             const chat = await message.getChat();
 
-            // Fetch real chat history
+            // Fetch chat history for context
             let history = [];
             try {
                 const fetched = await chat.fetchMessages({ limit: 15 });
-                history = fetched.map(msg => ({
-                    role: msg.fromMe ? "Nazim" : "User",
-                    content: msg.body
-                }));
+                history = fetched.map(m => ({
+                    role: m.fromMe ? 'Nazim' : 'User',
+                    content: m.body || ''
+                })).filter(m => m.content.trim());
+                // Ensure current message is at end
                 if (!history.length || history[history.length - 1].content !== body) {
-                    history.push({ role: "User", content: body });
+                    history.push({ role: 'User', content: body });
                 }
             } catch (e) {
-                history = [{ role: "User", content: body }];
+                history = [{ role: 'User', content: body }];
             }
 
             let userState = getOrInitState(userId);
             userState.history = history;
 
-            // =========================================================
-            // LOG FIRST MESSAGE — Name + Phone immediately
-            // =========================================================
+            // Log new lead to Sheets (first message only)
             if (!userState.hasLogged) {
                 try {
                     await appendToSheet({
                         date: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-                        name,
-                        phone,
-                        requirement: '',
-                        location: '',
-                        status: 'New Lead'
+                        name, phone, requirement: '', location: '', status: 'New Lead'
                     });
                     userState.hasLogged = true;
                     updateState(userId, userState);
-                    console.log(`[Sheets] ✅ New lead logged: ${name} (${phone})`);
+                    console.log(`[Sheets] ✅ Lead logged: ${name} (${phone})`);
                 } catch (e) {
-                    console.error('[Sheets] ❌ Failed to log new lead:', e.message);
+                    console.error('[Sheets] ❌ Lead log failed:', e.message);
                 }
             }
 
-            // =========================================================
-            // CAPTURE REQUIREMENT
-            // =========================================================
-            const detectedRequirement = extractRequirement(body);
-            if (detectedRequirement && !userState.requirementLogged) {
+            // Log car requirement when detected
+            const req = extractRequirement(body);
+            if (req && !userState.requirementLogged) {
                 try {
-                    await updateRequirement(phone, name, detectedRequirement);
+                    await updateRequirement(phone, name, req);
                     userState.requirementLogged = true;
-                    userState.vehicleInterest = detectedRequirement;
+                    userState.vehicleInterest = req;
                     updateState(userId, userState);
-                    console.log(`[Sheets] ✅ Requirement: "${detectedRequirement}"`);
+                    console.log(`[Sheets] ✅ Requirement: "${req}"`);
                 } catch (e) {
-                    console.error('[Sheets] ❌ Failed to update requirement:', e.message);
+                    console.error('[Sheets] ❌ Requirement update failed:', e.message);
                 }
             }
 
-            // =========================================================
-            // CAPTURE LOCATION
-            // =========================================================
-            const detectedLocation = extractLocation(body);
-            if (detectedLocation && !userState.locationLogged) {
+            // Log location when detected
+            const loc = extractLocation(body);
+            if (loc && !userState.locationLogged) {
                 try {
-                    await updateLocation(phone, detectedLocation);
+                    await updateLocation(phone, loc);
                     userState.locationLogged = true;
-                    userState.location = detectedLocation;
+                    userState.location = loc;
                     updateState(userId, userState);
-                    console.log(`[Sheets] ✅ Location: "${detectedLocation}"`);
+                    console.log(`[Sheets] ✅ Location: "${loc}"`);
                 } catch (e) {
-                    console.error('[Sheets] ❌ Failed to update location:', e.message);
+                    console.error('[Sheets] ❌ Location update failed:', e.message);
                 }
             }
 
-            // Rate limit before Gemini
-            await waitForRateLimit();
+            // Wait for Gemini rate limit slot
+            await waitForGeminiSlot();
 
+            // Get AI response
             const response = await getAIResponse(userId, body, userState);
 
-            // Step management
             if (userState.step === 0) {
                 userState.step = 1;
                 updateState(userId, userState);
             }
 
-            // Human-like delay
-            let delayMs = 2000;
-            if (response) {
-                const len = response.length;
-                if (len < 50) delayMs = Math.floor(Math.random() * 2000) + 2000;
-                else if (len < 150) delayMs = Math.floor(Math.random() * 3000) + 4000;
-                else delayMs = Math.floor(Math.random() * 4000) + 6000;
+            if (!response) return;
+
+            // Human-like typing delay
+            const len = response.length;
+            const delayMs = len < 60
+                ? 1500 + Math.random() * 1500
+                : len < 150
+                    ? 3000 + Math.random() * 2000
+                    : 4000 + Math.random() * 2000;
+
+            try { await chat.sendStateTyping(); } catch (_) { }
+            await new Promise(r => setTimeout(r, delayMs));
+
+            await client.sendMessage(userId, response);
+            console.log(`[Sent] → ${name}: ${response.substring(0, 60)}...`);
+
+        } catch (err) {
+            const msg = err.message || '';
+            console.error('❌ Message handler error:', msg);
+            // TargetCloseError = Puppeteer browser crashed → exit so Railway restarts
+            if (msg.includes('Target closed') || msg.includes('Session closed') || msg.includes('Protocol error')) {
+                console.error('[CRASH] Puppeteer died — exiting for Railway to restart cleanly');
+                process.exit(1);
             }
-
-            try { await chat.sendStateTyping(); } catch (e) { }
-
-            console.log(`[Delay] Waiting ${delayMs}ms...`);
-            await new Promise(resolve => setTimeout(resolve, delayMs));
-
-            if (response) {
-                await client.sendMessage(userId, response);
-            }
-
-        } catch (error) {
-            console.error('❌ Error handling message:', error);
         }
-    }); // end enqueueMessage
-}); // end client.on('message')
+    });
+});
 
 client.initialize();
