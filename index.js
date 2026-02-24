@@ -13,6 +13,42 @@ const {
 const businessInfo = require('./config/businessInfo');
 require('dotenv').config();
 
+// ============================================================
+// DEDUPLICATION CACHE — Prevents the bot from processing
+// the same message twice (fixes duplicate replies on reconnect)
+// ============================================================
+const processedMessageIds = new Set();
+const DEDUP_CACHE_MAX = 500; // Keep max 500 IDs to avoid memory leak
+
+function isDuplicate(msgId) {
+    if (processedMessageIds.has(msgId)) return true;
+    processedMessageIds.add(msgId);
+    // Trim cache if it grows too large
+    if (processedMessageIds.size > DEDUP_CACHE_MAX) {
+        const firstKey = processedMessageIds.values().next().value;
+        processedMessageIds.delete(firstKey);
+    }
+    return false;
+}
+
+// ============================================================
+// RATE LIMITER — Prevents hammering Gemini API
+// Limits to 1 request per 3 seconds globally
+// ============================================================
+let lastGeminiCallTime = 0;
+const MIN_GEMINI_INTERVAL_MS = 3000;
+
+async function waitForRateLimit() {
+    const now = Date.now();
+    const elapsed = now - lastGeminiCallTime;
+    if (elapsed < MIN_GEMINI_INTERVAL_MS) {
+        const wait = MIN_GEMINI_INTERVAL_MS - elapsed;
+        console.log(`[RateLimit] Waiting ${wait}ms before Gemini call...`);
+        await new Promise(r => setTimeout(r, wait));
+    }
+    lastGeminiCallTime = Date.now();
+}
+
 // Initialize Data on Startup
 (async () => {
     const scrapedData = await scrapeBusinessData();
@@ -23,7 +59,6 @@ require('dotenv').config();
 })();
 
 // --- RAILWAY KEEP-ALIVE SERVER ---
-// Railway requires the app to listen on a port, or it kills it.
 const http = require('http');
 const port = process.env.PORT || 8080;
 const server = http.createServer((req, res) => {
@@ -34,17 +69,14 @@ server.listen(port, () => {
     console.log(`[Server] Keep-alive server listening on port ${port}`);
 });
 
-
 // --- GLOBAL ERROR HANDLERS (Prevent Crash) ---
 process.on('uncaughtException', (err) => {
     console.error('CRITICAL ERROR (Uncaught):', err);
-    // Keep alive if possible, or exit gracefully
 });
 process.on('unhandledRejection', (reason, promise) => {
     console.error('CRITICAL ERROR (Unhandled Rejection):', reason);
 });
 
-// Initialize WhatsApp Client
 // Initialize WhatsApp Client
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -90,15 +122,20 @@ client.on('ready', () => {
 
 // Message Handling
 client.on('message', async (message) => {
-    // Ignore messages from status updates or groups (optional)
+    // Ignore group messages and status updates
     if (message.isStatus || message.from.includes('@g.us')) return;
+
+    // ✅ DEDUPLICATION: Skip if we've already processed this message
+    if (isDuplicate(message.id._serialized)) {
+        console.log(`[Dedup] Skipping already-processed message: ${message.id._serialized}`);
+        return;
+    }
 
     const userId = message.from;
     const body = message.body.trim();
 
     // 1. Check for Human Handoff (Host replies)
     if (message.fromMe) {
-        // If the business owner replies, pause AI for 30 minutes
         console.log(`Host replied to ${message.to}. Pausing AI.`);
         setHandoff(message.to, 30 * 60 * 1000);
         return;
@@ -116,9 +153,6 @@ client.on('message', async (message) => {
         const chat = await message.getChat();
 
         // --- FETCH REAL HISTORY (Memory Fix) ---
-        // Instead of relying on a JSON file that gets wiped, we ask WhatsApp for the chat history.
-        // This ensures the bot KNOWS if it already said "Hi, Nazim here".
-
         let history = [];
         try {
             const fetchedMessages = await chat.fetchMessages({ limit: 15 });
@@ -126,24 +160,22 @@ client.on('message', async (message) => {
                 role: msg.fromMe ? "Nazim" : "User",
                 content: msg.body
             }));
-            // Append current message if not yet in history (it usually is, but just in case)
             if (history.length === 0 || history[history.length - 1].content !== body) {
                 history.push({ role: "User", content: body });
             }
         } catch (histErr) {
             console.error("Failed to fetch chat history:", histErr);
-            history = [{ role: "User", content: body }]; // Fallback
+            history = [{ role: "User", content: body }];
         }
 
-        // Retrieve/Init User State (Just for Sheet Logging/Phase tracking, NOT for history)
+        // Retrieve/Init User State
         let userState = getOrInitState(userId);
-
-        let response;
-        // -- AI Logic --
-        // Pass the REAL history to the AI.
-        // We temporarily attach history to userState just for the function call, or specific arg
         userState.history = history;
 
+        // ✅ RATE LIMIT: Wait before calling Gemini
+        await waitForRateLimit();
+
+        let response;
         response = await getAIResponse(userId, body, userState);
 
         // --- GLOBAL LOCATION MONITOR ---
@@ -191,9 +223,9 @@ client.on('message', async (message) => {
         let delayMs = 2000;
         if (response) {
             const length = response.length;
-            if (length < 50) delayMs = Math.floor(Math.random() * 2000) + 2000; // 2-4s
+            if (length < 50) delayMs = Math.floor(Math.random() * 2000) + 2000;       // 2-4s
             else if (length < 150) delayMs = Math.floor(Math.random() * 3000) + 4000; // 4-7s
-            else delayMs = Math.floor(Math.random() * 4000) + 6000; // 6-10s
+            else delayMs = Math.floor(Math.random() * 4000) + 6000;                    // 6-10s
         }
 
         // Send "Typing..." Indicator

@@ -85,8 +85,10 @@ IMPORTANT MEMORY RULES:
         });
 
         // --- SEND THE CURRENT MESSAGE ---
-        let retries = 3;
-        while (retries > 0) {
+        // Retry with exponential backoff: 10s, 20s, 30s for 429 rate limits
+        const retryDelays = [10000, 20000, 30000];
+        let attempt = 0;
+        while (attempt <= retryDelays.length) {
             try {
                 const result = await chat.sendMessage(messageBody);
                 const text = result.response.text();
@@ -94,17 +96,21 @@ IMPORTANT MEMORY RULES:
             } catch (error) {
                 const errMsg = error.message || '';
                 if (errMsg.includes('429')) {
-                    console.error(`Gemini Rate Limit. Waiting before retry...`);
-                    await new Promise(r => setTimeout(r, 5000 * (4 - retries)));
+                    if (attempt >= retryDelays.length) {
+                        console.error(`Gemini Rate Limit exhausted after ${attempt} retries. Giving up.`);
+                        throw error;
+                    }
+                    const waitMs = retryDelays[attempt];
+                    console.error(`Gemini Rate Limit (429). Waiting ${waitMs / 1000}s before retry ${attempt + 1}/${retryDelays.length}...`);
+                    await new Promise(r => setTimeout(r, waitMs));
                 } else if (errMsg.includes('503')) {
-                    console.error(`Gemini Overloaded. Retrying...`);
-                    await new Promise(r => setTimeout(r, 2000));
+                    console.error(`Gemini Overloaded (503). Retrying in 5s...`);
+                    await new Promise(r => setTimeout(r, 5000));
                 } else {
                     console.error(`Gemini API Error:`, errMsg);
                     throw error;
                 }
-                retries--;
-                if (retries === 0) throw error;
+                attempt++;
             }
         }
 
