@@ -86,8 +86,8 @@ IMPORTANT MEMORY RULES:
         });
 
         // --- SEND THE CURRENT MESSAGE ---
-        // Retry with exponential backoff: 10s, 20s, 30s for 429 rate limits
-        const retryDelays = [10000, 20000, 30000];
+        // Retry with exponential backoff: 10s, 20s, 30s, 45s, 60s, 90s for 429 rate limits
+        const retryDelays = [10000, 20000, 30000, 45000, 60000, 90000];
         let attempt = 0;
         while (attempt <= retryDelays.length) {
             try {
