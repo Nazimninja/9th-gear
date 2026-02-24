@@ -1,5 +1,7 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
+const fs = require('fs');
+const path = require('path');
 const { getAIResponse } = require('./services/ai');
 const { appendToSheet, updateRequirement, updateLocation } = require('./services/sheets');
 const { scrapeBusinessData } = require('./services/scraper');
@@ -14,20 +16,56 @@ const businessInfo = require('./config/businessInfo');
 require('dotenv').config();
 
 // ============================================================
-// DEDUPLICATION CACHE — Prevents same message being processed twice
+// BOT START TIME — Only process messages received AFTER this moment.
+// This is the PRIMARY fix for duplicate messages on reconnect.
+// WhatsApp delivers old messages again when the bot restarts —
+// we simply reject anything older than our startup timestamp.
 // ============================================================
-const processedMessageIds = new Set();
-const DEDUP_CACHE_MAX = 500;
+const BOT_START_TIME_SECONDS = Math.floor(Date.now() / 1000);
+console.log(`[Boot] Bot started at timestamp: ${BOT_START_TIME_SECONDS}`);
+
+// ============================================================
+// PERSISTED DEDUP CACHE — Survives restarts (saved to disk)
+// Secondary safety net: even if a message has the same timestamp,
+// we won't process the same message ID twice.
+// ============================================================
+const DEDUP_FILE = path.join(__dirname, 'data', 'processed_ids.json');
+let processedMessageIds = new Set();
+
+function loadDedupCache() {
+    try {
+        if (fs.existsSync(DEDUP_FILE)) {
+            const data = JSON.parse(fs.readFileSync(DEDUP_FILE, 'utf8'));
+            processedMessageIds = new Set(data);
+            console.log(`[Dedup] Loaded ${processedMessageIds.size} processed message IDs from disk.`);
+        }
+    } catch (e) {
+        console.error('[Dedup] Failed to load cache:', e.message);
+    }
+}
+
+function saveDedupCache() {
+    try {
+        const arr = Array.from(processedMessageIds).slice(-500); // Keep latest 500
+        fs.writeFileSync(DEDUP_FILE, JSON.stringify(arr));
+    } catch (e) {
+        console.error('[Dedup] Failed to save cache:', e.message);
+    }
+}
 
 function isDuplicate(msgId) {
     if (processedMessageIds.has(msgId)) return true;
     processedMessageIds.add(msgId);
-    if (processedMessageIds.size > DEDUP_CACHE_MAX) {
+    // Keep max 500 entries
+    if (processedMessageIds.size > 500) {
         const firstKey = processedMessageIds.values().next().value;
         processedMessageIds.delete(firstKey);
     }
+    saveDedupCache(); // Persist immediately
     return false;
 }
+
+loadDedupCache();
 
 // ============================================================
 // RATE LIMITER — 3s minimum gap between Gemini calls
@@ -47,8 +85,7 @@ async function waitForRateLimit() {
 }
 
 // ============================================================
-// CLEAN PHONE NUMBER
-// Strips @c.us / @lid / @s.whatsapp.net — returns digits only
+// CLEAN PHONE NUMBER — strips @lid / @c.us / any suffix
 // ============================================================
 function cleanPhone(rawId) {
     return rawId.replace(/@.*$/, '').replace(/\D/g, '');
@@ -63,13 +100,15 @@ const CAR_KEYWORDS = [
     'maruti', 'suzuki', 'volkswagen', 'volvo', 'jeep', 'range rover', 'gle',
     'glc', 'xc90', 'fortuner', 'innova', 'creta', 'nexon', 'ertiga', 'swift',
     'pre-owned', 'preowned', 'pre owned', 'used', 'second hand', 'budget',
-    'price', 'lakh', 'lakhs', 'looking for', 'need a', 'want a', 'interested in'
+    'price', 'lakh', 'lakhs', 'looking for', 'need a', 'want a', 'interested in',
+    '3 series', '5 series', '7 series', 'e class', 'c class', 's class', 'a4', 'a6',
+    '320d', '520d', 'sport line', 'sport'
 ];
 
 function extractRequirement(body) {
     const lower = body.toLowerCase();
     const isCarRelated = CAR_KEYWORDS.some(kw => lower.includes(kw));
-    if (isCarRelated && body.length > 4) {
+    if (isCarRelated && body.length > 3) {
         return body.length > 200 ? body.substring(0, 200) + '...' : body;
     }
     return null;
@@ -77,7 +116,6 @@ function extractRequirement(body) {
 
 // ============================================================
 // EXTRACT LOCATION FROM MESSAGE
-// Detects Bangalore localities, Karnataka cities, or other cities
 // ============================================================
 const BANGALORE_AREAS = [
     'jp nagar', 'hsr layout', 'hsr', 'koramangala', 'indiranagar', 'whitefield',
@@ -141,11 +179,11 @@ server.listen(port, () => {
     console.log(`[Server] Keep-alive server listening on port ${port}`);
 });
 
-// --- GLOBAL ERROR HANDLERS (Prevent Crash) ---
+// --- GLOBAL ERROR HANDLERS ---
 process.on('uncaughtException', (err) => {
     console.error('CRITICAL ERROR (Uncaught):', err);
 });
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
     console.error('CRITICAL ERROR (Unhandled Rejection):', reason);
 });
 
@@ -176,7 +214,7 @@ const client = new Client({
     }
 });
 
-// Generate QR Code
+// QR Code
 client.on('qr', (qr) => {
     console.log('\n\n=============================================');
     console.log('   SCAN THIS QR CODE WITH WHATSAPP NOW:  ');
@@ -189,161 +227,161 @@ client.on('qr', (qr) => {
 });
 
 client.on('ready', () => {
-    console.log('WhatsApp AI Agent is ready!');
+    console.log(`✅ WhatsApp AI Agent is ready! Ignoring messages older than ${BOT_START_TIME_SECONDS}`);
 });
 
-// Message Handling
+// ============================================================
+// MESSAGE HANDLER
+// ============================================================
 client.on('message', async (message) => {
-    // Ignore group messages and status updates
+    // Ignore groups and status
     if (message.isStatus || message.from.includes('@g.us')) return;
 
-    // ✅ DEDUPLICATION: Skip already-processed messages
+    // ✅ FIX #1 — TIMESTAMP GUARD (PRIMARY duplicate fix)
+    // Reject messages that arrived BEFORE the bot started.
+    // This stops WhatsApp from re-delivering old messages on reconnect.
+    const msgTimestamp = message.timestamp; // Unix seconds
+    if (msgTimestamp < BOT_START_TIME_SECONDS) {
+        console.log(`[TimeGuard] Skipping old message (ts: ${msgTimestamp} < bot start: ${BOT_START_TIME_SECONDS})`);
+        return;
+    }
+
+    // ✅ FIX #2 — PERSISTED DEDUP CACHE (SECONDARY duplicate fix)
     if (isDuplicate(message.id._serialized)) {
-        console.log(`[Dedup] Skipping already-processed message: ${message.id._serialized}`);
+        console.log(`[Dedup] Skipping already-processed: ${message.id._serialized}`);
         return;
     }
 
     const userId = message.from;
     const body = message.body ? message.body.trim() : '';
+    if (!body) return; // Skip empty/media-only messages
 
-    // 1. Check for Human Handoff (Host replies)
+    // 1. Human Handoff
     if (message.fromMe) {
         console.log(`Host replied to ${message.to}. Pausing AI.`);
         setHandoff(message.to, 30 * 60 * 1000);
         return;
     }
 
-    // 2. Check if AI should be paused
+    // 2. Check if AI is paused
     if (isHandedOff(userId)) {
-        console.log(`AI paused for ${userId}. Ignoring message.`);
+        console.log(`AI paused for ${userId}. Ignoring.`);
         return;
     }
 
-    // 3. Process User Message
     try {
-        // --- EXTRACT CLEAN INFO ---
         const phone = cleanPhone(userId);
-        // Try multiple sources for name (WhatsApp sometimes uses different fields)
         const name = message._data?.notifyName
             || message._data?.pushName
             || message.notifyName
             || 'Unknown';
 
-        console.log(`Received from ${name} (${phone}): ${body}`);
+        console.log(`📩 [${new Date().toLocaleTimeString('en-IN')}] From ${name} (${phone}): ${body}`);
 
         const chat = await message.getChat();
 
-        // --- FETCH REAL HISTORY ---
+        // Fetch real chat history
         let history = [];
         try {
-            const fetchedMessages = await chat.fetchMessages({ limit: 15 });
-            history = fetchedMessages.map(msg => ({
+            const fetched = await chat.fetchMessages({ limit: 15 });
+            history = fetched.map(msg => ({
                 role: msg.fromMe ? "Nazim" : "User",
                 content: msg.body
             }));
-            if (history.length === 0 || history[history.length - 1].content !== body) {
+            if (!history.length || history[history.length - 1].content !== body) {
                 history.push({ role: "User", content: body });
             }
-        } catch (histErr) {
-            console.error("Failed to fetch chat history:", histErr);
+        } catch (e) {
             history = [{ role: "User", content: body }];
         }
 
-        // Retrieve/Init User State
         let userState = getOrInitState(userId);
         userState.history = history;
 
         // =========================================================
-        // ✅ LOG ON FIRST MESSAGE — Capture Name + Phone immediately
+        // LOG FIRST MESSAGE — Name + Phone immediately
         // =========================================================
         if (!userState.hasLogged) {
             try {
-                console.log(`[Sheets] New customer! Logging ${name} (${phone}) to sheet...`);
                 await appendToSheet({
                     date: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-                    name: name,
-                    phone: phone,
-                    requirement: 'New Enquiry',
+                    name,
+                    phone,
+                    requirement: '',
                     location: '',
                     status: 'New Lead'
                 });
                 userState.hasLogged = true;
-                userState.sheetRowPhone = phone;
                 updateState(userId, userState);
-                console.log(`[Sheets] ✅ Logged new customer: ${name} (${phone})`);
+                console.log(`[Sheets] ✅ New lead logged: ${name} (${phone})`);
             } catch (e) {
-                console.error("❌ [Sheets] Failed to log new customer:", e.message);
+                console.error('[Sheets] ❌ Failed to log new lead:', e.message);
             }
         }
 
         // =========================================================
-        // ✅ CAPTURE REQUIREMENT — Update when customer mentions car need
+        // CAPTURE REQUIREMENT
         // =========================================================
         const detectedRequirement = extractRequirement(body);
         if (detectedRequirement && !userState.requirementLogged) {
             try {
-                console.log(`[Sheets] Car requirement detected: "${detectedRequirement}". Updating sheet...`);
                 await updateRequirement(phone, name, detectedRequirement);
                 userState.requirementLogged = true;
                 userState.vehicleInterest = detectedRequirement;
                 updateState(userId, userState);
-                console.log(`[Sheets] ✅ Requirement updated for ${phone}`);
+                console.log(`[Sheets] ✅ Requirement: "${detectedRequirement}"`);
             } catch (e) {
-                console.error("❌ [Sheets] Failed to update requirement:", e.message);
+                console.error('[Sheets] ❌ Failed to update requirement:', e.message);
             }
         }
 
         // =========================================================
-        // ✅ CAPTURE LOCATION — Detect from message and update sheet
+        // CAPTURE LOCATION
         // =========================================================
         const detectedLocation = extractLocation(body);
         if (detectedLocation && !userState.locationLogged) {
             try {
-                console.log(`[Sheets] Location detected: "${detectedLocation}". Updating sheet...`);
                 await updateLocation(phone, detectedLocation);
                 userState.locationLogged = true;
                 userState.location = detectedLocation;
                 updateState(userId, userState);
-                console.log(`[Sheets] ✅ Location updated for ${phone}: ${detectedLocation}`);
+                console.log(`[Sheets] ✅ Location: "${detectedLocation}"`);
             } catch (e) {
-                console.error("❌ [Sheets] Failed to update location:", e.message);
+                console.error('[Sheets] ❌ Failed to update location:', e.message);
             }
         }
 
-        // ✅ RATE LIMIT: Wait before calling Gemini
+        // Rate limit before Gemini
         await waitForRateLimit();
 
-        let response;
-        response = await getAIResponse(userId, body, userState);
+        const response = await getAIResponse(userId, body, userState);
 
-        // --- STEP MANAGEMENT ---
+        // Step management
         if (userState.step === 0) {
             userState.step = 1;
             updateState(userId, userState);
         }
 
-        // --- HUMAN-LIKE DELAY LOGIC ---
+        // Human-like delay
         let delayMs = 2000;
         if (response) {
-            const length = response.length;
-            if (length < 50) delayMs = Math.floor(Math.random() * 2000) + 2000;
-            else if (length < 150) delayMs = Math.floor(Math.random() * 3000) + 4000;
+            const len = response.length;
+            if (len < 50) delayMs = Math.floor(Math.random() * 2000) + 2000;
+            else if (len < 150) delayMs = Math.floor(Math.random() * 3000) + 4000;
             else delayMs = Math.floor(Math.random() * 4000) + 6000;
         }
 
-        // Send "Typing..." Indicator
         try { await chat.sendStateTyping(); } catch (e) { }
 
-        console.log(`[Human Delay] Waiting ${delayMs}ms before sending...`);
+        console.log(`[Delay] Waiting ${delayMs}ms...`);
         await new Promise(resolve => setTimeout(resolve, delayMs));
 
-        // Send Response
         if (response) {
             await client.sendMessage(userId, response);
         }
 
     } catch (error) {
-        console.error('Error handling message:', error);
+        console.error('❌ Error handling message:', error);
     }
 });
 
