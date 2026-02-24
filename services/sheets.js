@@ -2,7 +2,7 @@ const { google } = require('googleapis');
 require('dotenv').config();
 
 // ============================================================
-// Build Google Auth from env vars (supports both file path and JSON string)
+// Build Google Auth from env vars (supports file path or JSON string)
 // ============================================================
 async function getAuthClient() {
     const googleCreds = process.env.GOOGLE_APPLICATION_CREDENTIALS;
@@ -23,7 +23,7 @@ async function getAuthClient() {
             throw new Error('Failed to parse GOOGLE_APPLICATION_CREDENTIALS JSON: ' + err.message);
         }
     } else {
-        // File path (local)
+        // File path (local development)
         authOptions.keyFile = googleCreds;
     }
 
@@ -32,8 +32,31 @@ async function getAuthClient() {
 }
 
 // ============================================================
-// APPEND — Logs a new row when customer first messages
-// Columns: Date | Name | Phone | Requirement | Status
+// HELPER — find a customer's sheet row by phone number
+// Searches column C (index 2), returns 1-indexed row number or -1
+// ============================================================
+async function findRowByPhone(sheets, phone) {
+    const res = await sheets.spreadsheets.values.get({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        range: 'Sheet1!A:F'
+    });
+
+    const rows = res.data.values || [];
+    const cleanedPhone = phone.toString().replace(/\D/g, '');
+
+    // Search from bottom up — get most recent row for this number
+    for (let i = rows.length - 1; i >= 0; i--) {
+        const rowPhone = (rows[i][2] || '').toString().replace(/\D/g, '');
+        if (rowPhone === cleanedPhone) {
+            return i + 1; // 1-indexed
+        }
+    }
+    return -1;
+}
+
+// ============================================================
+// APPEND — Logs new row when customer first messages
+// Columns: A=Date | B=Name | C=Phone | D=Requirement | E=Location | F=Status
 // ============================================================
 async function appendToSheet(data) {
     try {
@@ -42,16 +65,17 @@ async function appendToSheet(data) {
 
         await sheets.spreadsheets.values.append({
             spreadsheetId: process.env.SPREADSHEET_ID,
-            range: 'Sheet1!A:E',
+            range: 'Sheet1!A:F',
             valueInputOption: 'USER_ENTERED',
             insertDataOption: 'INSERT_ROWS',
             resource: {
                 values: [[
-                    data.date,        // A: Date (IST)
-                    data.name,        // B: Customer Name
-                    data.phone,       // C: Clean Phone Number
-                    data.requirement, // D: Car Requirement
-                    data.status       // E: Status
+                    data.date,                        // A: Date (IST)
+                    data.name,                        // B: Customer Name
+                    data.phone,                       // C: Clean Phone Number
+                    data.requirement || 'New Enquiry',// D: Car Requirement
+                    data.location || '',              // E: Location
+                    data.status || 'New Lead'         // F: Status
                 ]]
             }
         });
@@ -63,59 +87,86 @@ async function appendToSheet(data) {
 }
 
 // ============================================================
-// UPDATE REQUIREMENT — Finds the customer's row by phone
-// and updates the Requirement column (column D)
+// UPDATE REQUIREMENT — Updates Column D for a customer's row
 // ============================================================
 async function updateRequirement(phone, name, requirement) {
     try {
         const client = await getAuthClient();
         const sheets = google.sheets({ version: 'v4', auth: client });
 
-        // Read all rows to find the customer's row by phone number
-        const readRes = await sheets.spreadsheets.values.get({
-            spreadsheetId: process.env.SPREADSHEET_ID,
-            range: 'Sheet1!A:E'
-        });
-
-        const rows = readRes.data.values || [];
-        let targetRow = -1;
-
-        // Search from bottom up — find most recent row with this phone
-        for (let i = rows.length - 1; i >= 0; i--) {
-            // Phone is column C (index 2)
-            if (rows[i][2] && rows[i][2].toString().replace(/\D/g, '') === phone.replace(/\D/g, '')) {
-                targetRow = i + 1; // Sheets rows are 1-indexed
-                break;
-            }
-        }
+        const targetRow = await findRowByPhone(sheets, phone);
 
         if (targetRow === -1) {
-            // Row not found — append fresh row instead
             console.log(`[Sheets] Phone ${phone} not found, appending new requirement row.`);
             await appendToSheet({
                 date: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
                 name: name,
                 phone: phone,
                 requirement: requirement,
+                location: '',
                 status: 'Active Lead'
             });
             return;
         }
 
-        // Update column D (Requirement) and E (Status) on found row
+        // Update Requirement (D) and Status (F)
         await sheets.spreadsheets.values.update({
             spreadsheetId: process.env.SPREADSHEET_ID,
-            range: `Sheet1!D${targetRow}:E${targetRow}`,
+            range: `Sheet1!D${targetRow}:D${targetRow}`,
             valueInputOption: 'USER_ENTERED',
-            resource: {
-                values: [[requirement, 'Active Lead']]
-            }
+            resource: { values: [[requirement]] }
         });
 
-        console.log(`[Sheets] ✅ Requirement updated on row ${targetRow}: "${requirement}"`);
+        // Update status to Active Lead
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `Sheet1!F${targetRow}:F${targetRow}`,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [['Active Lead']] }
+        });
+
+        console.log(`[Sheets] ✅ Requirement updated (row ${targetRow}): "${requirement}"`);
     } catch (error) {
         console.error('[Sheets] updateRequirement Error:', error.message);
     }
 }
 
-module.exports = { appendToSheet, updateRequirement };
+// ============================================================
+// UPDATE LOCATION — Updates Column E for a customer's row
+// ============================================================
+async function updateLocation(phone, location) {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+
+        const targetRow = await findRowByPhone(sheets, phone);
+
+        if (targetRow === -1) {
+            console.log(`[Sheets] Phone ${phone} not found for location update. Skipping.`);
+            return;
+        }
+
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `Sheet1!E${targetRow}:E${targetRow}`,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[location]] }
+        });
+
+        // Also mark as Qualified if they're a Bangalore area
+        if (location.toLowerCase().includes('bangalore')) {
+            await sheets.spreadsheets.values.update({
+                spreadsheetId: process.env.SPREADSHEET_ID,
+                range: `Sheet1!F${targetRow}:F${targetRow}`,
+                valueInputOption: 'USER_ENTERED',
+                resource: { values: [['Qualified Lead']] }
+            });
+        }
+
+        console.log(`[Sheets] ✅ Location updated (row ${targetRow}): "${location}"`);
+    } catch (error) {
+        console.error('[Sheets] updateLocation Error:', error.message);
+    }
+}
+
+module.exports = { appendToSheet, updateRequirement, updateLocation };

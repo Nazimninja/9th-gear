@@ -1,7 +1,7 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { getAIResponse } = require('./services/ai');
-const { appendToSheet, updateRequirement } = require('./services/sheets');
+const { appendToSheet, updateRequirement, updateLocation } = require('./services/sheets');
 const { scrapeBusinessData } = require('./services/scraper');
 const {
     getOrInitState,
@@ -56,7 +56,6 @@ function cleanPhone(rawId) {
 
 // ============================================================
 // EXTRACT CAR REQUIREMENT FROM MESSAGE
-// Returns the requirement text if the message talks about a car need
 // ============================================================
 const CAR_KEYWORDS = [
     'car', 'suv', 'sedan', 'hatchback', 'luxury', 'bmw', 'mercedes', 'benz',
@@ -71,10 +70,55 @@ function extractRequirement(body) {
     const lower = body.toLowerCase();
     const isCarRelated = CAR_KEYWORDS.some(kw => lower.includes(kw));
     if (isCarRelated && body.length > 4) {
-        // Trim to 200 chars max for Sheet cell
         return body.length > 200 ? body.substring(0, 200) + '...' : body;
     }
     return null;
+}
+
+// ============================================================
+// EXTRACT LOCATION FROM MESSAGE
+// Detects Bangalore localities, Karnataka cities, or other cities
+// ============================================================
+const BANGALORE_AREAS = [
+    'jp nagar', 'hsr layout', 'hsr', 'koramangala', 'indiranagar', 'whitefield',
+    'electronic city', 'marathahalli', 'bellandur', 'sarjapur', 'bannerghatta',
+    'jayanagar', 'btm layout', 'btm', 'wilson garden', 'shivajinagar', 'mg road',
+    'brigade road', 'lavelle road', 'ub city', 'sadashivanagar', 'malleshwaram',
+    'yeshwanthpur', 'rajajinagar', 'vijayanagar', 'hebbal', 'yelahanka',
+    'devanahalli', 'kengeri', 'mysore road', 'tumkur road', 'cunningham road',
+    'richmond town', 'langford town', 'cox town', 'frazer town', 'banaswadi',
+    'hbr layout', 'kalyan nagar', 'rt nagar', 'ramamurthy nagar', 'mahadevapura',
+    'kr puram', 'tin factory', 'old airport road', 'hal', 'domlur', 'ejipura',
+    'jakkur', 'thanisandra', 'hennur', 'nagawara', 'sahakara nagar', 'sanjaynagar',
+    'mathikere', 'peenya', 'dasarahalli', 'chikkabanavara', 'bangalore', 'bengaluru', 'blr'
+];
+
+const KARNATAKA_CITIES = [
+    'mysore', 'mysuru', 'mangalore', 'mangaluru', 'hubli', 'dharwad',
+    'belgaum', 'bellary', 'tumkur', 'hassan', 'mandya', 'shimoga', 'davangere'
+];
+
+const OTHER_CITIES = [
+    'mumbai', 'delhi', 'chennai', 'hyderabad', 'pune', 'kolkata', 'ahmedabad',
+    'surat', 'jaipur', 'lucknow', 'noida', 'gurgaon'
+];
+
+function extractLocation(body) {
+    const lower = body.toLowerCase();
+    for (const area of BANGALORE_AREAS) {
+        if (lower.includes(area)) return `Bangalore - ${toTitleCase(area)}`;
+    }
+    for (const city of KARNATAKA_CITIES) {
+        if (lower.includes(city)) return toTitleCase(city) + ', Karnataka';
+    }
+    for (const city of OTHER_CITIES) {
+        if (lower.includes(city)) return toTitleCase(city);
+    }
+    return null;
+}
+
+function toTitleCase(str) {
+    return str.replace(/\b\w/g, c => c.toUpperCase());
 }
 
 // Initialize Data on Startup
@@ -220,10 +264,11 @@ client.on('message', async (message) => {
                     name: name,
                     phone: phone,
                     requirement: 'New Enquiry',
+                    location: '',
                     status: 'New Lead'
                 });
                 userState.hasLogged = true;
-                userState.sheetRowPhone = phone; // Save for later requirement update
+                userState.sheetRowPhone = phone;
                 updateState(userId, userState);
                 console.log(`[Sheets] ✅ Logged new customer: ${name} (${phone})`);
             } catch (e) {
@@ -232,7 +277,7 @@ client.on('message', async (message) => {
         }
 
         // =========================================================
-        // ✅ CAPTURE REQUIREMENT — Update sheet when customer mentions car need
+        // ✅ CAPTURE REQUIREMENT — Update when customer mentions car need
         // =========================================================
         const detectedRequirement = extractRequirement(body);
         if (detectedRequirement && !userState.requirementLogged) {
@@ -245,6 +290,23 @@ client.on('message', async (message) => {
                 console.log(`[Sheets] ✅ Requirement updated for ${phone}`);
             } catch (e) {
                 console.error("❌ [Sheets] Failed to update requirement:", e.message);
+            }
+        }
+
+        // =========================================================
+        // ✅ CAPTURE LOCATION — Detect from message and update sheet
+        // =========================================================
+        const detectedLocation = extractLocation(body);
+        if (detectedLocation && !userState.locationLogged) {
+            try {
+                console.log(`[Sheets] Location detected: "${detectedLocation}". Updating sheet...`);
+                await updateLocation(phone, detectedLocation);
+                userState.locationLogged = true;
+                userState.location = detectedLocation;
+                updateState(userId, userState);
+                console.log(`[Sheets] ✅ Location updated for ${phone}: ${detectedLocation}`);
+            } catch (e) {
+                console.error("❌ [Sheets] Failed to update location:", e.message);
             }
         }
 
