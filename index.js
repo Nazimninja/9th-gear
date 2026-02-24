@@ -44,7 +44,7 @@ function isDuplicate(msgId) {
 // Prevents 429 rate limits when multiple users message simultaneously.
 // ============================================================
 let messageQueue = Promise.resolve();
-const GEMINI_CALL_INTERVAL_MS = 6000; // 10 RPM safe gap (1 per 6s)
+const GEMINI_CALL_INTERVAL_MS = 8000; // gemini-2.0-flash = 10 RPM limit → 8s gap = safe 7.5/min
 let lastGeminiCallTime = 0;
 
 function enqueueMessage(handler) {

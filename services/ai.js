@@ -5,7 +5,7 @@ require('dotenv').config();
 if (!process.env.GEMINI_API_KEY) {
     console.error('❌ CRITICAL: GEMINI_API_KEY is missing!');
 } else {
-    console.log('✅ Gemini API Key loaded. Model: gemini-1.5-flash');
+    console.log('✅ Gemini API Key loaded. Model: gemini-2.0-flash');
 }
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
@@ -65,7 +65,7 @@ MEMORY RULES (read chat history before every reply):
 
         // ── SEND TO GEMINI ──────────────────────────────────────
         const model = genAI.getGenerativeModel({
-            model: 'gemini-1.5-flash',
+            model: 'gemini-2.0-flash',
             systemInstruction: systemPrompt,
         });
 
