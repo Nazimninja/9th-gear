@@ -310,6 +310,14 @@ const client = new Client({
             '--disable-extensions',
             '--disable-component-extensions-with-background-pages',
             '--disable-notifications',
+            '--disable-background-networking',
+            '--disable-sync',
+            '--disable-translate',
+            '--hide-scrollbars',
+            '--metrics-recording-only',
+            '--mute-audio',
+            '--safebrowsing-disable-auto-update',
+            '--js-flags=--max-old-space-size=256',
             '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         ],
         bypassCSP: true
@@ -318,17 +326,31 @@ const client = new Client({
 
 // QR Code
 client.on('qr', (qr) => {
-    latestQR = qr; // Store for the /qr web endpoint
-    console.log('\n\n=============================================');
-    console.log('   QR READY — open your Railway public URL + /qr to scan');
-    console.log('=============================================\n');
+    latestQR = qr;
+    console.log('\n[QR] Ready — open your Railway public URL + /qr to scan');
     qrcode.generate(qr, { small: true });
-    console.log('\n=============================================\n');
 });
 
 client.on('ready', () => {
-    latestQR = null; // Clear QR once connected
-    console.log(`✅ WhatsApp AI Agent is ready! Ignoring messages older than ${BOT_START_TIME_SECONDS}`);
+    latestQR = null;
+    console.log(`✅ WhatsApp AI Agent is ready!`);
+});
+
+client.on('auth_failure', (msg) => {
+    console.error('❌ Auth failure:', msg);
+});
+
+// AUTO-RECONNECT: when Puppeteer crashes or WhatsApp disconnects,
+// wait 5s then reinitialize. This is the fix for TargetCloseError.
+client.on('disconnected', (reason) => {
+    console.warn(`⚠️ WhatsApp disconnected: ${reason}. Reinitializing in 5s...`);
+    latestQR = null;
+    setTimeout(() => {
+        console.log('[Reconnect] Calling client.initialize()...');
+        client.initialize().catch(err => {
+            console.error('[Reconnect] Failed to reinitialize:', err.message);
+        });
+    }, 5000);
 });
 
 // ============================================================
