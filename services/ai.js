@@ -78,9 +78,10 @@ IMPORTANT MEMORY RULES:
         const chat = model.startChat({
             history: geminiHistory,
             generationConfig: {
-                temperature: 0.85,   // Natural & varied, not robotic
-                maxOutputTokens: 250, // Enough for a thoughtful but concise reply
-                topP: 0.9,
+                temperature: 0.95,    // High variety — no two replies should sound the same
+                maxOutputTokens: 280, // Concise WhatsApp replies
+                topP: 0.95,
+                topK: 40,
             },
         });
 
@@ -116,7 +117,14 @@ IMPORTANT MEMORY RULES:
 
     } catch (error) {
         console.error("❌ Gemini API Fatal Error:", error.message);
-        return "Just a moment, checking that for you.";
+        // Human-sounding fallback — pick one randomly so even errors sound natural
+        const fallbacks = [
+            "Hey sorry, bit tied up right now. I'll get back to you in a minute!",
+            "Sorry hold on, give me a sec 🙏",
+            "My bad, just a moment — will reply shortly!",
+            "Sorry, just stepped away — back in a bit!"
+        ];
+        return fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
 }
 
