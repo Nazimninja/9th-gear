@@ -1,7 +1,7 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const { getAIResponse } = require('./services/ai');
-const { appendToSheet } = require('./services/sheets');
+const { appendToSheet, updateRequirement } = require('./services/sheets');
 const { scrapeBusinessData } = require('./services/scraper');
 const {
     getOrInitState,
@@ -14,16 +14,14 @@ const businessInfo = require('./config/businessInfo');
 require('dotenv').config();
 
 // ============================================================
-// DEDUPLICATION CACHE — Prevents the bot from processing
-// the same message twice (fixes duplicate replies on reconnect)
+// DEDUPLICATION CACHE — Prevents same message being processed twice
 // ============================================================
 const processedMessageIds = new Set();
-const DEDUP_CACHE_MAX = 500; // Keep max 500 IDs to avoid memory leak
+const DEDUP_CACHE_MAX = 500;
 
 function isDuplicate(msgId) {
     if (processedMessageIds.has(msgId)) return true;
     processedMessageIds.add(msgId);
-    // Trim cache if it grows too large
     if (processedMessageIds.size > DEDUP_CACHE_MAX) {
         const firstKey = processedMessageIds.values().next().value;
         processedMessageIds.delete(firstKey);
@@ -32,8 +30,7 @@ function isDuplicate(msgId) {
 }
 
 // ============================================================
-// RATE LIMITER — Prevents hammering Gemini API
-// Limits to 1 request per 3 seconds globally
+// RATE LIMITER — 3s minimum gap between Gemini calls
 // ============================================================
 let lastGeminiCallTime = 0;
 const MIN_GEMINI_INTERVAL_MS = 3000;
@@ -47,6 +44,37 @@ async function waitForRateLimit() {
         await new Promise(r => setTimeout(r, wait));
     }
     lastGeminiCallTime = Date.now();
+}
+
+// ============================================================
+// CLEAN PHONE NUMBER
+// Strips @c.us / @lid / @s.whatsapp.net — returns digits only
+// ============================================================
+function cleanPhone(rawId) {
+    return rawId.replace(/@.*$/, '').replace(/\D/g, '');
+}
+
+// ============================================================
+// EXTRACT CAR REQUIREMENT FROM MESSAGE
+// Returns the requirement text if the message talks about a car need
+// ============================================================
+const CAR_KEYWORDS = [
+    'car', 'suv', 'sedan', 'hatchback', 'luxury', 'bmw', 'mercedes', 'benz',
+    'audi', 'toyota', 'honda', 'hyundai', 'kia', 'ford', 'tata', 'mahindra',
+    'maruti', 'suzuki', 'volkswagen', 'volvo', 'jeep', 'range rover', 'gle',
+    'glc', 'xc90', 'fortuner', 'innova', 'creta', 'nexon', 'ertiga', 'swift',
+    'pre-owned', 'preowned', 'pre owned', 'used', 'second hand', 'budget',
+    'price', 'lakh', 'lakhs', 'looking for', 'need a', 'want a', 'interested in'
+];
+
+function extractRequirement(body) {
+    const lower = body.toLowerCase();
+    const isCarRelated = CAR_KEYWORDS.some(kw => lower.includes(kw));
+    if (isCarRelated && body.length > 4) {
+        // Trim to 200 chars max for Sheet cell
+        return body.length > 200 ? body.substring(0, 200) + '...' : body;
+    }
+    return null;
 }
 
 // Initialize Data on Startup
@@ -125,14 +153,14 @@ client.on('message', async (message) => {
     // Ignore group messages and status updates
     if (message.isStatus || message.from.includes('@g.us')) return;
 
-    // ✅ DEDUPLICATION: Skip if we've already processed this message
+    // ✅ DEDUPLICATION: Skip already-processed messages
     if (isDuplicate(message.id._serialized)) {
         console.log(`[Dedup] Skipping already-processed message: ${message.id._serialized}`);
         return;
     }
 
     const userId = message.from;
-    const body = message.body.trim();
+    const body = message.body ? message.body.trim() : '';
 
     // 1. Check for Human Handoff (Host replies)
     if (message.fromMe) {
@@ -149,10 +177,19 @@ client.on('message', async (message) => {
 
     // 3. Process User Message
     try {
-        console.log(`Received message from ${userId}: ${body}`);
+        // --- EXTRACT CLEAN INFO ---
+        const phone = cleanPhone(userId);
+        // Try multiple sources for name (WhatsApp sometimes uses different fields)
+        const name = message._data?.notifyName
+            || message._data?.pushName
+            || message.notifyName
+            || 'Unknown';
+
+        console.log(`Received from ${name} (${phone}): ${body}`);
+
         const chat = await message.getChat();
 
-        // --- FETCH REAL HISTORY (Memory Fix) ---
+        // --- FETCH REAL HISTORY ---
         let history = [];
         try {
             const fetchedMessages = await chat.fetchMessages({ limit: 15 });
@@ -172,50 +209,54 @@ client.on('message', async (message) => {
         let userState = getOrInitState(userId);
         userState.history = history;
 
+        // =========================================================
+        // ✅ LOG ON FIRST MESSAGE — Capture Name + Phone immediately
+        // =========================================================
+        if (!userState.hasLogged) {
+            try {
+                console.log(`[Sheets] New customer! Logging ${name} (${phone}) to sheet...`);
+                await appendToSheet({
+                    date: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+                    name: name,
+                    phone: phone,
+                    requirement: 'New Enquiry',
+                    status: 'New Lead'
+                });
+                userState.hasLogged = true;
+                userState.sheetRowPhone = phone; // Save for later requirement update
+                updateState(userId, userState);
+                console.log(`[Sheets] ✅ Logged new customer: ${name} (${phone})`);
+            } catch (e) {
+                console.error("❌ [Sheets] Failed to log new customer:", e.message);
+            }
+        }
+
+        // =========================================================
+        // ✅ CAPTURE REQUIREMENT — Update sheet when customer mentions car need
+        // =========================================================
+        const detectedRequirement = extractRequirement(body);
+        if (detectedRequirement && !userState.requirementLogged) {
+            try {
+                console.log(`[Sheets] Car requirement detected: "${detectedRequirement}". Updating sheet...`);
+                await updateRequirement(phone, name, detectedRequirement);
+                userState.requirementLogged = true;
+                userState.vehicleInterest = detectedRequirement;
+                updateState(userId, userState);
+                console.log(`[Sheets] ✅ Requirement updated for ${phone}`);
+            } catch (e) {
+                console.error("❌ [Sheets] Failed to update requirement:", e.message);
+            }
+        }
+
         // ✅ RATE LIMIT: Wait before calling Gemini
         await waitForRateLimit();
 
         let response;
         response = await getAIResponse(userId, body, userState);
 
-        // --- GLOBAL LOCATION MONITOR ---
-        if (!userState.hasLogged) {
-            const karnatakaKeywords = ['bangalore', 'bengaluru', 'karnataka', 'mysore', 'mangalore', 'whitefield', 'indiranagar', 'koramangala', 'hsr', 'jayanagar', 'jp nagar', 'sadashivanagar', 'yes', 'blr'];
-            const isQualified = karnatakaKeywords.some(loc => body.toLowerCase().includes(loc));
-            const isLocationPhase = (userState.step === 1);
-            const hasLocationKeyword = isQualified || ['mumbai', 'delhi', 'chennai', 'hyderabad', 'pune', 'city', 'town'].some(w => body.toLowerCase().includes(w));
-
-            if (isQualified || isLocationPhase || hasLocationKeyword) {
-                try {
-                    const status = isQualified ? "Qualified Lead" : "Lead (d)";
-                    console.log(`[Main] Lead Detected (${status}): "${body}". Logging to Sheets...`);
-
-                    await appendToSheet({
-                        date: new Date().toISOString(),
-                        name: message._data.notifyName || "Unknown",
-                        phone: userId.replace('@c.us', ''),
-                        vehicle: userState.vehicleInterest || "Pending",
-                        location: body,
-                        status: status
-                    });
-                    console.log("[Main] Successfully logged lead.");
-
-                    userState.hasLogged = true;
-                    userState.step = 2;
-                    updateState(userId, userState);
-
-                } catch (e) {
-                    console.error("❌ [Main] Sheet Logging Failed:", e.message);
-                }
-            }
-        }
-
         // --- STEP MANAGEMENT ---
         if (userState.step === 0) {
             userState.step = 1;
-            updateState(userId, userState);
-        } else if (userState.step === 1 && userState.hasLogged) {
-            userState.step = 2;
             updateState(userId, userState);
         }
 
@@ -223,9 +264,9 @@ client.on('message', async (message) => {
         let delayMs = 2000;
         if (response) {
             const length = response.length;
-            if (length < 50) delayMs = Math.floor(Math.random() * 2000) + 2000;       // 2-4s
-            else if (length < 150) delayMs = Math.floor(Math.random() * 3000) + 4000; // 4-7s
-            else delayMs = Math.floor(Math.random() * 4000) + 6000;                    // 6-10s
+            if (length < 50) delayMs = Math.floor(Math.random() * 2000) + 2000;
+            else if (length < 150) delayMs = Math.floor(Math.random() * 3000) + 4000;
+            else delayMs = Math.floor(Math.random() * 4000) + 6000;
         }
 
         // Send "Typing..." Indicator
