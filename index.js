@@ -69,17 +69,25 @@ function isDuplicate(msgId) {
 loadDedupCache();
 
 // ============================================================
-// RATE LIMITER — 3s minimum gap between Gemini calls
+// SERIAL MESSAGE QUEUE — only ONE Gemini call runs at a time.
+// All incoming messages are chained onto this promise so even
+// if 10 people message simultaneously, they process one-by-one.
+// This is the REAL fix for 429 rate limit errors.
 // ============================================================
+let messageQueue = Promise.resolve();
+const MIN_GEMINI_INTERVAL_MS = 7000; // safe for 15 RPM (1 per 6s + buffer)
 let lastGeminiCallTime = 0;
-const MIN_GEMINI_INTERVAL_MS = 3000;
+
+function enqueueMessage(handler) {
+    messageQueue = messageQueue.then(() => handler()).catch(() => { });
+}
 
 async function waitForRateLimit() {
     const now = Date.now();
     const elapsed = now - lastGeminiCallTime;
     if (elapsed < MIN_GEMINI_INTERVAL_MS) {
         const wait = MIN_GEMINI_INTERVAL_MS - elapsed;
-        console.log(`[RateLimit] Waiting ${wait}ms before Gemini call...`);
+        console.log(`[Queue] Waiting ${wait}ms before next Gemini call...`);
         await new Promise(r => setTimeout(r, wait));
     }
     lastGeminiCallTime = Date.now();
@@ -327,156 +335,162 @@ client.on('ready', () => {
 // MESSAGE HANDLER
 // ============================================================
 client.on('message', async (message) => {
-    // Ignore groups and status
+    // Ignore groups and status — fast check, outside queue
     if (message.isStatus || message.from.includes('@g.us')) return;
 
-    // ✅ FIX #1 — TIMESTAMP GUARD (PRIMARY duplicate fix)
-    // Reject messages that arrived BEFORE the bot started.
-    // This stops WhatsApp from re-delivering old messages on reconnect.
-    const msgTimestamp = message.timestamp; // Unix seconds
+    // Fast pre-checks outside the queue
+    const msgTimestamp = message.timestamp;
     if (msgTimestamp < BOT_START_TIME_SECONDS) {
         console.log(`[TimeGuard] Skipping old message (ts: ${msgTimestamp} < bot start: ${BOT_START_TIME_SECONDS})`);
         return;
     }
-
-    // ✅ FIX #2 — PERSISTED DEDUP CACHE (SECONDARY duplicate fix)
     if (isDuplicate(message.id._serialized)) {
         console.log(`[Dedup] Skipping already-processed: ${message.id._serialized}`);
         return;
     }
 
-    const userId = message.from;
-    const body = message.body ? message.body.trim() : '';
-    if (!body) return; // Skip empty/media-only messages
+    // Push ALL actual processing into the serial queue
+    // Only ONE message is processed at a time — prevents parallel 429s
+    enqueueMessage(async () => {
 
-    // 1. Human Handoff
-    if (message.fromMe) {
-        console.log(`Host replied to ${message.to}. Pausing AI.`);
-        setHandoff(message.to, 30 * 60 * 1000);
-        return;
-    }
+        if (isDuplicate(message.id._serialized)) {
+            console.log(`[Dedup] Skipping already-processed: ${message.id._serialized}`);
+            return;
+        }
 
-    // 2. Check if AI is paused
-    if (isHandedOff(userId)) {
-        console.log(`AI paused for ${userId}. Ignoring.`);
-        return;
-    }
+        const userId = message.from;
+        const body = message.body ? message.body.trim() : '';
+        if (!body) return; // Skip empty/media-only messages
 
-    try {
-        // ✅ Get REAL phone number from WhatsApp contact (not the @lid internal hash)
-        const phone = await getRealPhone(message);
-        const name = message._data?.notifyName
-            || message._data?.pushName
-            || message.notifyName
-            || 'Unknown';
+        // 1. Human Handoff
+        if (message.fromMe) {
+            console.log(`Host replied to ${message.to}. Pausing AI.`);
+            setHandoff(message.to, 30 * 60 * 1000);
+            return;
+        }
 
-        console.log(`📩 [${new Date().toLocaleTimeString('en-IN')}] From ${name} (${phone}): ${body}`);
+        // 2. Check if AI is paused
+        if (isHandedOff(userId)) {
+            console.log(`AI paused for ${userId}. Ignoring.`);
+            return;
+        }
 
-        const chat = await message.getChat();
-
-        // Fetch real chat history
-        let history = [];
         try {
-            const fetched = await chat.fetchMessages({ limit: 15 });
-            history = fetched.map(msg => ({
-                role: msg.fromMe ? "Nazim" : "User",
-                content: msg.body
-            }));
-            if (!history.length || history[history.length - 1].content !== body) {
-                history.push({ role: "User", content: body });
-            }
-        } catch (e) {
-            history = [{ role: "User", content: body }];
-        }
+            // ✅ Get REAL phone number from WhatsApp contact (not the @lid internal hash)
+            const phone = await getRealPhone(message);
+            const name = message._data?.notifyName
+                || message._data?.pushName
+                || message.notifyName
+                || 'Unknown';
 
-        let userState = getOrInitState(userId);
-        userState.history = history;
+            console.log(`📩 [${new Date().toLocaleTimeString('en-IN')}] From ${name} (${phone}): ${body}`);
 
-        // =========================================================
-        // LOG FIRST MESSAGE — Name + Phone immediately
-        // =========================================================
-        if (!userState.hasLogged) {
+            const chat = await message.getChat();
+
+            // Fetch real chat history
+            let history = [];
             try {
-                await appendToSheet({
-                    date: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-                    name,
-                    phone,
-                    requirement: '',
-                    location: '',
-                    status: 'New Lead'
-                });
-                userState.hasLogged = true;
-                updateState(userId, userState);
-                console.log(`[Sheets] ✅ New lead logged: ${name} (${phone})`);
+                const fetched = await chat.fetchMessages({ limit: 15 });
+                history = fetched.map(msg => ({
+                    role: msg.fromMe ? "Nazim" : "User",
+                    content: msg.body
+                }));
+                if (!history.length || history[history.length - 1].content !== body) {
+                    history.push({ role: "User", content: body });
+                }
             } catch (e) {
-                console.error('[Sheets] ❌ Failed to log new lead:', e.message);
+                history = [{ role: "User", content: body }];
             }
-        }
 
-        // =========================================================
-        // CAPTURE REQUIREMENT
-        // =========================================================
-        const detectedRequirement = extractRequirement(body);
-        if (detectedRequirement && !userState.requirementLogged) {
-            try {
-                await updateRequirement(phone, name, detectedRequirement);
-                userState.requirementLogged = true;
-                userState.vehicleInterest = detectedRequirement;
+            let userState = getOrInitState(userId);
+            userState.history = history;
+
+            // =========================================================
+            // LOG FIRST MESSAGE — Name + Phone immediately
+            // =========================================================
+            if (!userState.hasLogged) {
+                try {
+                    await appendToSheet({
+                        date: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+                        name,
+                        phone,
+                        requirement: '',
+                        location: '',
+                        status: 'New Lead'
+                    });
+                    userState.hasLogged = true;
+                    updateState(userId, userState);
+                    console.log(`[Sheets] ✅ New lead logged: ${name} (${phone})`);
+                } catch (e) {
+                    console.error('[Sheets] ❌ Failed to log new lead:', e.message);
+                }
+            }
+
+            // =========================================================
+            // CAPTURE REQUIREMENT
+            // =========================================================
+            const detectedRequirement = extractRequirement(body);
+            if (detectedRequirement && !userState.requirementLogged) {
+                try {
+                    await updateRequirement(phone, name, detectedRequirement);
+                    userState.requirementLogged = true;
+                    userState.vehicleInterest = detectedRequirement;
+                    updateState(userId, userState);
+                    console.log(`[Sheets] ✅ Requirement: "${detectedRequirement}"`);
+                } catch (e) {
+                    console.error('[Sheets] ❌ Failed to update requirement:', e.message);
+                }
+            }
+
+            // =========================================================
+            // CAPTURE LOCATION
+            // =========================================================
+            const detectedLocation = extractLocation(body);
+            if (detectedLocation && !userState.locationLogged) {
+                try {
+                    await updateLocation(phone, detectedLocation);
+                    userState.locationLogged = true;
+                    userState.location = detectedLocation;
+                    updateState(userId, userState);
+                    console.log(`[Sheets] ✅ Location: "${detectedLocation}"`);
+                } catch (e) {
+                    console.error('[Sheets] ❌ Failed to update location:', e.message);
+                }
+            }
+
+            // Rate limit before Gemini
+            await waitForRateLimit();
+
+            const response = await getAIResponse(userId, body, userState);
+
+            // Step management
+            if (userState.step === 0) {
+                userState.step = 1;
                 updateState(userId, userState);
-                console.log(`[Sheets] ✅ Requirement: "${detectedRequirement}"`);
-            } catch (e) {
-                console.error('[Sheets] ❌ Failed to update requirement:', e.message);
             }
-        }
 
-        // =========================================================
-        // CAPTURE LOCATION
-        // =========================================================
-        const detectedLocation = extractLocation(body);
-        if (detectedLocation && !userState.locationLogged) {
-            try {
-                await updateLocation(phone, detectedLocation);
-                userState.locationLogged = true;
-                userState.location = detectedLocation;
-                updateState(userId, userState);
-                console.log(`[Sheets] ✅ Location: "${detectedLocation}"`);
-            } catch (e) {
-                console.error('[Sheets] ❌ Failed to update location:', e.message);
+            // Human-like delay
+            let delayMs = 2000;
+            if (response) {
+                const len = response.length;
+                if (len < 50) delayMs = Math.floor(Math.random() * 2000) + 2000;
+                else if (len < 150) delayMs = Math.floor(Math.random() * 3000) + 4000;
+                else delayMs = Math.floor(Math.random() * 4000) + 6000;
             }
+
+            try { await chat.sendStateTyping(); } catch (e) { }
+
+            console.log(`[Delay] Waiting ${delayMs}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+
+            if (response) {
+                await client.sendMessage(userId, response);
+            }
+
+        } catch (error) {
+            console.error('❌ Error handling message:', error);
         }
-
-        // Rate limit before Gemini
-        await waitForRateLimit();
-
-        const response = await getAIResponse(userId, body, userState);
-
-        // Step management
-        if (userState.step === 0) {
-            userState.step = 1;
-            updateState(userId, userState);
-        }
-
-        // Human-like delay
-        let delayMs = 2000;
-        if (response) {
-            const len = response.length;
-            if (len < 50) delayMs = Math.floor(Math.random() * 2000) + 2000;
-            else if (len < 150) delayMs = Math.floor(Math.random() * 3000) + 4000;
-            else delayMs = Math.floor(Math.random() * 4000) + 6000;
-        }
-
-        try { await chat.sendStateTyping(); } catch (e) { }
-
-        console.log(`[Delay] Waiting ${delayMs}ms...`);
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-
-        if (response) {
-            await client.sendMessage(userId, response);
-        }
-
-    } catch (error) {
-        console.error('❌ Error handling message:', error);
-    }
-});
+    }); // end enqueueMessage
+}); // end client.on('message')
 
 client.initialize();
