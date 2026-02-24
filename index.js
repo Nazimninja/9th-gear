@@ -49,9 +49,8 @@ process.on('unhandledRejection', (reason, promise) => {
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
-        headless: "new",
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-        dumpio: true,
+        headless: true,
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -59,10 +58,10 @@ const client = new Client({
             '--disable-accelerated-2d-canvas',
             '--no-first-run',
             '--no-zygote',
+            '--single-process',
             '--disable-gpu',
             '--disable-features=site-per-process',
             '--no-default-browser-check',
-            '--no-first-run',
             '--disable-default-apps',
             '--disable-extensions',
             '--disable-component-extensions-with-background-pages',
@@ -75,13 +74,14 @@ const client = new Client({
 
 // Generate QR Code
 client.on('qr', (qr) => {
-    console.log('Scan this QR code with WhatsApp:');
+    console.log('\n\n=============================================');
+    console.log('   SCAN THIS QR CODE WITH WHATSAPP NOW:  ');
+    console.log('=============================================\n');
     qrcode.generate(qr, { small: true });
-
-    console.log('\n--- IF SCANNING FAILS ---');
-    console.log('Copy the code below and paste it into: https://www.the-qrcode-generator.com/');
+    console.log('\n=============================================');
+    console.log('IF QR IS BLURRY — paste this at qr-code-generator.com:');
     console.log(qr);
-    console.log('-------------------------\n');
+    console.log('=============================================\n');
 });
 
 client.on('ready', () => {

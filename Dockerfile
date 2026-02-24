@@ -1,6 +1,6 @@
-FROM node:20
+FROM node:20-slim
 
-# 1. Install dependencies for Chromium (Puppeteer)
+# 1. Install system dependencies for Chromium (Puppeteer)
 RUN apt-get update && apt-get install -y \
     chromium \
     fonts-ipafont-gothic \
@@ -8,11 +8,24 @@ RUN apt-get update && apt-get install -y \
     fonts-thai-tlwg \
     fonts-kacst \
     fonts-freefont-ttf \
-    libxss1 \
+    libgbm-dev \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libcups2 \
+    libdrm2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libxkbcommon0 \
+    libasound2 \
+    libpangocairo-1.0-0 \
+    libnspr4 \
+    libnss3 \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Tell Puppeteer to skip downloading Chrome. We'll be using the installed package.
+# 2. Tell Puppeteer to skip downloading Chrome — use system Chromium instead
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
@@ -22,15 +35,14 @@ WORKDIR /usr/src/app
 # 4. Copy package files
 COPY package*.json ./
 
-# 5. Install dependencies
-RUN npm install
+# 5. Install Node dependencies
+RUN npm install --omit=dev
 
 # 6. Copy app source
 COPY . .
 
-# 7. Create data directory for persistence (Fixes ENOENT crash)
+# 7. Create data directory (Fixes ENOENT crash)
 RUN mkdir -p /usr/src/app/data
 
 # 8. Start the bot
 CMD [ "node", "index.js" ]
-
