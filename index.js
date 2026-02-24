@@ -1,5 +1,6 @@
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
+const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const { getAIResponse } = require('./services/ai');
@@ -218,15 +219,58 @@ function toTitleCase(str) {
     }
 })();
 
-// --- RAILWAY KEEP-ALIVE SERVER ---
+// --- RAILWAY HTTP SERVER — serves /qr so you can scan from your phone ---
 const http = require('http');
 const port = process.env.PORT || 8080;
-const server = http.createServer((req, res) => {
+
+let latestQR = null; // stored whenever 'qr' event fires
+
+const server = http.createServer(async (req, res) => {
+    if (req.url === '/qr') {
+        if (!latestQR) {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#111;color:#fff">
+<h2>✅ WhatsApp already connected — no QR needed!</h2>
+<p>If the bot just restarted, refresh in a few seconds.</p>
+</body></html>`);
+            return;
+        }
+        try {
+            const qrImageDataUrl = await QRCode.toDataURL(latestQR, { width: 400, margin: 2 });
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(`<!DOCTYPE html>
+<html>
+<head>
+  <title>Scan QR — 9th Gear Bot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { margin:0; background:#0d0d0d; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; font-family:sans-serif; color:#fff; }
+    h2 { font-size:1.4rem; margin-bottom:8px; }
+    p  { color:#aaa; font-size:0.9rem; margin-bottom:24px; }
+    img { border-radius:16px; box-shadow:0 0 40px #00e87644; }
+    .note { margin-top:20px; font-size:0.8rem; color:#666; }
+  </style>
+</head>
+<body>
+  <h2>📱 Scan with WhatsApp</h2>
+  <p>Open WhatsApp → Linked Devices → Link a Device</p>
+  <img src="${qrImageDataUrl}" width="300" height="300" />
+  <p class="note">QR expires in ~20 seconds. Refresh if it doesn't scan.</p>
+  <script>setTimeout(()=>location.reload(), 20000);</script>
+</body>
+</html>`);
+        } catch (e) {
+            res.writeHead(500);
+            res.end('QR generation failed: ' + e.message);
+        }
+        return;
+    }
+    // Default keep-alive
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Nazim (9th Gear AI) is Running! 🚀\n');
+    res.end('Nazim (9th Gear AI) is Running! 🚀\nVisit /qr to scan the WhatsApp QR code.\n');
 });
 server.listen(port, () => {
-    console.log(`[Server] Keep-alive server listening on port ${port}`);
+    console.log(`[Server] HTTP server on port ${port} — visit /qr to scan QR code`);
 });
 
 // --- GLOBAL ERROR HANDLERS ---
@@ -266,17 +310,16 @@ const client = new Client({
 
 // QR Code
 client.on('qr', (qr) => {
+    latestQR = qr; // Store for the /qr web endpoint
     console.log('\n\n=============================================');
-    console.log('   SCAN THIS QR CODE WITH WHATSAPP NOW:  ');
+    console.log('   QR READY — open your Railway public URL + /qr to scan');
     console.log('=============================================\n');
     qrcode.generate(qr, { small: true });
-    console.log('\n=============================================');
-    console.log('IF QR IS BLURRY — paste this at qr-code-generator.com:');
-    console.log(qr);
-    console.log('=============================================\n');
+    console.log('\n=============================================\n');
 });
 
 client.on('ready', () => {
+    latestQR = null; // Clear QR once connected
     console.log(`✅ WhatsApp AI Agent is ready! Ignoring messages older than ${BOT_START_TIME_SECONDS}`);
 });
 
