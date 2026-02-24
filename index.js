@@ -85,10 +85,25 @@ async function waitForRateLimit() {
 }
 
 // ============================================================
-// CLEAN PHONE NUMBER — strips @lid / @c.us / any suffix
+// CLEAN PHONE — use contact's real number (avoids @lid garbage)
 // ============================================================
 function cleanPhone(rawId) {
+    // Fallback: strip @c.us / @lid etc. and any non-digits
     return rawId.replace(/@.*$/, '').replace(/\D/g, '');
+}
+
+async function getRealPhone(message) {
+    try {
+        const contact = await message.getContact();
+        // contact.number is the actual phone number WhatsApp gave us
+        if (contact && contact.number) {
+            return contact.number.replace(/\D/g, ''); // digits only
+        }
+    } catch (e) {
+        console.log('[Phone] getContact() failed, falling back:', e.message);
+    }
+    // Fallback to parsing the userId
+    return cleanPhone(message.from);
 }
 
 // ============================================================
@@ -105,10 +120,45 @@ const CAR_KEYWORDS = [
     '320d', '520d', 'sport line', 'sport'
 ];
 
+// ─── SPECIFIC CAR BRANDS / MODELS (must have at least one of these)
+const CAR_BRANDS = [
+    'bmw', 'mercedes', 'benz', 'audi', 'toyota', 'honda', 'hyundai', 'kia',
+    'ford', 'tata', 'mahindra', 'maruti', 'suzuki', 'volkswagen', 'vw', 'volvo',
+    'jeep', 'range rover', 'land rover', 'porsche', 'lexus', 'jaguar', 'skoda',
+    'evoque', 'defender', 'discovery', 'freelander', 'cayenne', 'macan',
+    'gle', 'glc', 'gla', 'glb', 'e class', 'c class', 's class', 'a class',
+    'e200', 'e220', 'c200', 'c220', 'c300',
+    '3 series', '5 series', '7 series', 'x1', 'x3', 'x5', 'x7',
+    '320d', '520d', '530d', '730d', '118i', '120i',
+    'a4', 'a6', 'a8', 'q3', 'q5', 'q7', 'q8',
+    'xc60', 'xc90', 'xc40',
+    'fortuner', 'innova', 'crysta', 'legender',
+    'creta', 'nexon', 'harrier', 'safari', 'thar',
+    'city', 'civic', 'accord', 'cr-v',
+    'celerio', 'baleno', 'brezza', 'ertiga', 'swift',
+    'tucson', 'santa fe', 'veloster', 'elantra',
+    'octavia', 'superb', 'kodiaq',
+    'endeavour', 'mustang', 'ecosport',
+    'bolero', 'xuv', 'xuv500', 'xuv700', 'scorpio'
+];
+
+// ─── BUYING INTENT PHRASES (signals they actively want to buy)
+const BUYING_PHRASES = [
+    'looking for', 'i want', 'i need', 'want to buy', 'planning to buy',
+    'interested in', 'searching for', 'i am looking', 'im looking',
+    'budget is', 'my budget', 'can i get'
+];
+
 function extractRequirement(body) {
     const lower = body.toLowerCase();
-    const isCarRelated = CAR_KEYWORDS.some(kw => lower.includes(kw));
-    if (isCarRelated && body.length > 3) {
+
+    // Must mention a specific brand/model
+    const hasBrand = CAR_BRANDS.some(brand => lower.includes(brand));
+    // OR must have a strong buying intent
+    const hasIntent = BUYING_PHRASES.some(phrase => lower.includes(phrase));
+
+    if ((hasBrand || hasIntent) && body.length > 3) {
+        // Clean up: limit to 200 chars
         return body.length > 200 ? body.substring(0, 200) + '...' : body;
     }
     return null;
@@ -270,7 +320,8 @@ client.on('message', async (message) => {
     }
 
     try {
-        const phone = cleanPhone(userId);
+        // ✅ Get REAL phone number from WhatsApp contact (not the @lid internal hash)
+        const phone = await getRealPhone(message);
         const name = message._data?.notifyName
             || message._data?.pushName
             || message.notifyName
