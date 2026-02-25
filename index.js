@@ -6,6 +6,7 @@ const path = require('path');
 const { getAIResponse } = require('./services/ai');
 const { appendToSheet, updateRequirement, updateLocation } = require('./services/sheets');
 const { scrapeBusinessData } = require('./services/scraper');
+const { logConversation, startLearningScheduler } = require('./services/learningEngine');
 const {
     getOrInitState,
     updateState,
@@ -265,6 +266,8 @@ client.on('qr', (qr) => {
 client.on('ready', () => {
     latestQR = null;
     console.log('✅ WhatsApp connected and ready!');
+    // Start learning engine — loads tips immediately, runs analysis cycle every 2 hours
+    startLearningScheduler();
 });
 
 client.on('auth_failure', (msg) => {
@@ -293,6 +296,11 @@ client.on('message', async (message) => {
         // You replied manually → pause AI for this contact for 30min
         console.log(`[Handoff] Manual reply to ${message.to} — AI paused 30min`);
         setHandoff(message.to, 30 * 60 * 1000);
+        // Log handoff so the learning engine knows the bot needed human help here
+        const st = getOrInitState(message.to);
+        if (st.history && st.history.length > 0) {
+            logConversation(message.to, st.name || 'Unknown', st.phone || '', st.history, 'Handoff').catch(() => { });
+        }
         return;
     }
 
@@ -437,6 +445,24 @@ client.on('message', async (message) => {
 
             await client.sendMessage(userId, response);
             console.log(`[Sent] → ${name}: ${response.substring(0, 60)}...`);
+
+            // ── LOG CONVERSATION FOR LEARNING ─────────────────────
+            // Classify outcome based on what we know about this customer
+            let outcome = 'Engaged';
+            if (userState.requirementLogged && userState.locationLogged) {
+                outcome = 'Qualified';
+            } else if (userState.requirementLogged) {
+                outcome = 'Lead Captured';
+            }
+            // Log every ~3rd reply per user (avoid excess Sheets writes)
+            userState.replyCount = (userState.replyCount || 0) + 1;
+            if (userState.replyCount % 3 === 0) {
+                // store name/phone on state so handoff logger can access them
+                userState.name = name;
+                userState.phone = phone;
+                updateState(userId, userState);
+                logConversation(userId, name, phone, userState.history || [], outcome).catch(() => { });
+            }
 
         } catch (err) {
             const msg = err.message || '';

@@ -1,5 +1,6 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const businessInfo = require('../config/businessInfo');
+const { getLearningTips } = require('./learningEngine');
 require('dotenv').config();
 
 if (!process.env.GEMINI_API_KEY) {
@@ -26,8 +27,13 @@ async function getAIResponse(userId, messageBody, userState) {
         }
 
         // ── BUILD SYSTEM PROMPT ─────────────────────────────────
-        const systemPrompt = `${businessInfo.systemPrompt}
+        // Fetch learning tips (cached in memory, refreshed every 2h)
+        const learningTips = await getLearningTips();
+        const learningSection = learningTips
+            ? `\n━━━━━━━━━━━━━━━━━━━━━━━\nCOACHING TIPS FROM EXPERIENCE (learned from real past conversations — follow these):\n━━━━━━━━━━━━━━━━━━━━━━━\n${learningTips}\n`
+            : '';
 
+        const systemPrompt = `${businessInfo.systemPrompt}${learningSection}
 CURRENT INVENTORY (use ONLY this — do NOT make up cars):
 ${buildInventoryText()}
 

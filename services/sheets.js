@@ -3,10 +3,10 @@ require('dotenv').config();
 
 // ============================================================
 // SHEET TAB CONFIG
-// Change SHEET_TAB to write to a different tab at any time.
 // ============================================================
-const SHEET_TAB = 'Leads'; // New clean tab — fresh start
-// Column layout: A=Date | B=Name | C=Phone | D=Requirement | E=Location | F=Status
+const SHEET_TAB = 'Leads';     // A=Date | B=Name | C=Phone | D=Requirement | E=Location | F=Status
+const CONVOLOG_TAB = 'ConvoLog'; // A=Date | B=Name | C=Phone | D=Summary | E=Outcome
+const LEARNING_TAB = 'Learning'; // A=Date | B=Tip
 
 // ============================================================
 // Build Google Auth
@@ -171,4 +171,99 @@ async function updateLocation(phone, location) {
     }
 }
 
-module.exports = { appendToSheet, updateRequirement, updateLocation };
+// ============================================================
+// CONVERSATION LOG — write to ConvoLog tab
+// Called by the learning engine after each conversation.
+// ============================================================
+async function appendConversationLog({ date, name, phone, summary, outcome }) {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${CONVOLOG_TAB}!A:E`,
+            valueInputOption: 'USER_ENTERED',
+            insertDataOption: 'INSERT_ROWS',
+            resource: { values: [[date, name, phone, summary, outcome]] }
+        });
+        console.log(`[Sheets] ✅ ConvoLog: ${name} (${outcome})`);
+    } catch (err) {
+        console.error('[Sheets] appendConversationLog error:', err.message);
+    }
+}
+
+// ============================================================
+// LEARNING TIP — write one tip to Learning tab
+// ============================================================
+async function appendLearningTip({ date, tip }) {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        await sheets.spreadsheets.values.append({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${LEARNING_TAB}!A:B`,
+            valueInputOption: 'USER_ENTERED',
+            insertDataOption: 'INSERT_ROWS',
+            resource: { values: [[date, tip]] }
+        });
+    } catch (err) {
+        console.error('[Sheets] appendLearningTip error:', err.message);
+    }
+}
+
+// ============================================================
+// GET CONVERSATION LOGS — read recent rows from ConvoLog tab
+// Returns array of {date, name, phone, summary, outcome}
+// ============================================================
+async function getConversationLogs(limit = 30) {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        const res = await sheets.spreadsheets.values.get({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${CONVOLOG_TAB}!A:E`
+        });
+        const rows = (res.data.values || []).filter(r => r[0] && r[3]); // must have date + summary
+        const recent = rows.slice(-limit);
+        return recent.map(r => ({
+            date: r[0] || '',
+            name: r[1] || 'Unknown',
+            phone: r[2] || '',
+            summary: r[3] || '',
+            outcome: r[4] || 'Unknown',
+        }));
+    } catch (err) {
+        console.error('[Sheets] getConversationLogs error:', err.message);
+        return [];
+    }
+}
+
+// ============================================================
+// GET LEARNING TIPS — read all tips from Learning tab
+// Returns array of tip strings
+// ============================================================
+async function getLearningTipsFromSheet() {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        const res = await sheets.spreadsheets.values.get({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${LEARNING_TAB}!A:B`
+        });
+        const rows = (res.data.values || []).filter(r => r[1] && r[1].trim().length > 5);
+        return rows.map(r => r[1].trim()); // column B = tip text
+    } catch (err) {
+        console.error('[Sheets] getLearningTipsFromSheet error:', err.message);
+        return [];
+    }
+}
+
+module.exports = {
+    appendToSheet,
+    updateRequirement,
+    updateLocation,
+    appendConversationLog,
+    appendLearningTip,
+    getConversationLogs,
+    getLearningTipsFromSheet,
+};
