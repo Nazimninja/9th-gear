@@ -4,9 +4,18 @@ require('dotenv').config();
 // ============================================================
 // SHEET TAB CONFIG
 // ============================================================
-const SHEET_TAB = 'Leads';     // A=Date | B=Name | C=Phone | D=Requirement | E=Location | F=Status
+const SHEET_TAB = 'Leads';
+//  A = Date First Contacted
+//  B = Customer Name
+//  C = Phone Number
+//  D = Car Requirement (what they want)
+//  E = Location (city/area)
+//  F = Status (New Lead / Active Lead / Qualified Lead / Follow-Up #1 Sent / Follow-Up #2 Sent / Follow-Up Stopped / Won)
+//  G = Last Active Date (last time customer replied to bot)
+//  H = Follow-Up Count (0, 1, 2 — tracks how many follow-ups were sent)
+//  I = Car Alerts Sent (models already alerted — prevents duplicate alerts)
 const CONVOLOG_TAB = 'ConvoLog'; // A=Date | B=Name | C=Phone | D=Summary | E=Outcome
-const LEARNING_TAB = 'Learning'; // A=Date | B=Tip
+const LEARNING_TAB = 'Learning'; // A=Date | B=Coaching Tip
 
 // ============================================================
 // Build Google Auth
@@ -172,6 +181,182 @@ async function updateLocation(phone, location) {
 }
 
 // ============================================================
+// INIT LEADS HEADERS — writes column headers to row 1 if sheet is empty
+// Makes the sheet self-documenting for Nazim to read easily
+// ============================================================
+async function initLeadsHeaders() {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        // Check if row 1 already has headers
+        const check = await sheets.spreadsheets.values.get({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${SHEET_TAB}!A1:I1`
+        });
+        const row1 = (check.data.values || [[]])[0] || [];
+        if (row1[0] === 'Date First Contacted') return; // already has headers
+
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${SHEET_TAB}!A1:I1`,
+            valueInputOption: 'USER_ENTERED',
+            resource: {
+                values: [[
+                    'Date First Contacted',
+                    'Customer Name',
+                    'Phone Number',
+                    'Car Requirement',
+                    'Location / City',
+                    'Status',
+                    'Last Active Date',
+                    'Follow-Up Count',
+                    'Car Alerts Sent (models)'
+                ]]
+            }
+        });
+        console.log('[Sheets] ✅ Leads tab headers written.');
+    } catch (err) {
+        console.error('[Sheets] initLeadsHeaders error:', err.message);
+    }
+}
+
+// ============================================================
+// UPDATE LAST ACTIVE — write timestamp to column G
+// Called after every customer message received by the bot
+// ============================================================
+async function updateLastActive(phone) {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        const targetRow = await findRowByPhone(sheets, phone);
+        if (targetRow === -1) return;
+
+        const ts = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${SHEET_TAB}!G${targetRow}:G${targetRow}`,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[ts]] }
+        });
+    } catch (err) {
+        console.error('[Sheets] updateLastActive error:', err.message);
+    }
+}
+
+// ============================================================
+// GET LEADS FOR FOLLOW-UP — read all leads with follow-up data
+// Returns array of lead objects including follow-up columns G/H/I
+// ============================================================
+async function getLeadsForFollowUp() {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        const res = await sheets.spreadsheets.values.get({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${SHEET_TAB}!A:I`
+        });
+        const rows = (res.data.values || []);
+        // Skip header row if present
+        const dataRows = rows.filter(r => r[0] && r[0] !== 'Date First Contacted');
+
+        return dataRows.map(r => {
+            const lastActiveStr = r[6] || '';  // Column G
+            const lastActiveMs = lastActiveStr ? new Date(lastActiveStr).getTime() : 0;
+            return {
+                date: r[0] || '',
+                name: r[1] || 'Customer',
+                phone: r[2] || '',
+                requirement: r[3] || '',
+                location: r[4] || '',
+                status: r[5] || 'New Lead',
+                lastActive: lastActiveStr,
+                lastActiveMs: isNaN(lastActiveMs) ? 0 : lastActiveMs,
+                followUpCount: parseInt(r[7] || '0', 10),
+                carAlertsLog: r[8] || '',
+            };
+        });
+    } catch (err) {
+        console.error('[Sheets] getLeadsForFollowUp error:', err.message);
+        return [];
+    }
+}
+
+// ============================================================
+// UPDATE FOLLOW-UP COUNT — write count (0/1/2) to column H
+// ============================================================
+async function updateFollowUpCount(phone, count) {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        const targetRow = await findRowByPhone(sheets, phone);
+        if (targetRow === -1) return;
+
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${SHEET_TAB}!H${targetRow}:H${targetRow}`,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[count]] }
+        });
+    } catch (err) {
+        console.error('[Sheets] updateFollowUpCount error:', err.message);
+    }
+}
+
+// ============================================================
+// UPDATE LEAD STATUS — write status string to column F
+// e.g. 'Follow-Up #1 Sent', 'Follow-Up Stopped', 'Won'
+// ============================================================
+async function updateLeadStatus(phone, status) {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        const targetRow = await findRowByPhone(sheets, phone);
+        if (targetRow === -1) return;
+
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${SHEET_TAB}!F${targetRow}:F${targetRow}`,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[status]] }
+        });
+        console.log(`[Sheets] ✅ Status updated for ${phone}: ${status}`);
+    } catch (err) {
+        console.error('[Sheets] updateLeadStatus error:', err.message);
+    }
+}
+
+// ============================================================
+// MARK CAR ALERT SENT — append car model name to column I
+// Prevents the same car from being re-alerted to the same customer
+// ============================================================
+async function markCarAlertSent(phone, carModel) {
+    try {
+        const client = await getAuthClient();
+        const sheets = google.sheets({ version: 'v4', auth: client });
+        const targetRow = await findRowByPhone(sheets, phone);
+        if (targetRow === -1) return;
+
+        // Read current column I value
+        const res = await sheets.spreadsheets.values.get({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${SHEET_TAB}!I${targetRow}:I${targetRow}`
+        });
+        const existing = ((res.data.values || [[]])[0] || [''])[0] || '';
+        const updated = existing ? `${existing}, ${carModel}` : carModel;
+
+        await sheets.spreadsheets.values.update({
+            spreadsheetId: process.env.SPREADSHEET_ID,
+            range: `${SHEET_TAB}!I${targetRow}:I${targetRow}`,
+            valueInputOption: 'USER_ENTERED',
+            resource: { values: [[updated]] }
+        });
+        console.log(`[Sheets] ✅ Car alert logged for ${phone}: ${carModel}`);
+    } catch (err) {
+        console.error('[Sheets] markCarAlertSent error:', err.message);
+    }
+}
+
+// ============================================================
 // CONVERSATION LOG — write to ConvoLog tab
 // Called by the learning engine after each conversation.
 // ============================================================
@@ -259,9 +444,18 @@ async function getLearningTipsFromSheet() {
 }
 
 module.exports = {
+    // Core lead management
     appendToSheet,
     updateRequirement,
     updateLocation,
+    // Follow-up engine
+    initLeadsHeaders,
+    updateLastActive,
+    getLeadsForFollowUp,
+    updateFollowUpCount,
+    updateLeadStatus,
+    markCarAlertSent,
+    // Learning engine
     appendConversationLog,
     appendLearningTip,
     getConversationLogs,

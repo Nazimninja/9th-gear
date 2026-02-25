@@ -4,9 +4,10 @@ const QRCode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 const { getAIResponse } = require('./services/ai');
-const { appendToSheet, updateRequirement, updateLocation } = require('./services/sheets');
+const { appendToSheet, updateRequirement, updateLocation, initLeadsHeaders, updateLastActive } = require('./services/sheets');
 const { scrapeBusinessData, startInventoryRefresh } = require('./services/scraper');
 const { logConversation, startLearningScheduler } = require('./services/learningEngine');
+const { startFollowUpScheduler } = require('./services/followUpEngine');
 const {
     getOrInitState,
     updateState,
@@ -175,6 +176,8 @@ function extractLocation(body) {
     }
     // Refresh inventory every hour so sold cars are removed promptly
     startInventoryRefresh(businessInfo);
+    // Init Leads sheet column headers (only writes if not already present)
+    initLeadsHeaders().catch(() => { });
 })();
 
 // ============================================================
@@ -272,6 +275,8 @@ client.on('ready', () => {
     console.log('✅ WhatsApp connected and ready!');
     // Start learning engine — loads tips immediately, runs analysis cycle every 2 hours
     startLearningScheduler();
+    // Start follow-up scheduler — sends Day-3 and Day-6 follow-ups at 9 AM IST daily
+    startFollowUpScheduler(client);
 });
 
 client.on('auth_failure', (msg) => {
@@ -449,6 +454,9 @@ client.on('message', async (message) => {
 
             await client.sendMessage(userId, response);
             console.log(`[Sent] → ${name}: ${response.substring(0, 60)}...`);
+
+            // Update last active time for follow-up tracking
+            updateLastActive(phone).catch(() => { });
 
             // ── LOG CONVERSATION FOR LEARNING ─────────────────────
             // Classify outcome based on what we know about this customer

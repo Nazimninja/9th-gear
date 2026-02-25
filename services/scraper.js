@@ -163,7 +163,8 @@ async function scrapeBusinessData() {
 
 /**
  * Start hourly inventory refresh (call once on bot startup, after first scrape).
- * This ensures sold cars are promptly removed within 1 hour of being taken off the site.
+ * After each refresh, compares old vs new to detect newly listed cars
+ * and fires car alerts to matching leads.
  */
 function startInventoryRefresh(businessInfo) {
     const ONE_HOUR = 60 * 60 * 1000;
@@ -171,12 +172,23 @@ function startInventoryRefresh(businessInfo) {
     setInterval(async () => {
         console.log('[Scraper] 🔄 Hourly inventory refresh starting...');
         try {
-            // Force fresh scrape by clearing the cache
+            // Snapshot the current inventory BEFORE scraping (for new-car detection)
+            const previousVehicles = [...(businessInfo.vehicles || [])];
+
+            // Force fresh scrape by clearing the cache timestamp
             lastScrapeTime = 0;
             const data = await scrapeBusinessData();
+
             if (data.vehicles.length > 0) {
                 businessInfo.vehicles = data.vehicles;
                 console.log(`[Scraper] ✅ Inventory updated: ${data.vehicles.length} live cars.`);
+
+                // Detect newly listed cars and alert matching leads
+                // (lazy-require to avoid circular dependency at module load time)
+                const { sendCarAlerts } = require('./followUpEngine');
+                sendCarAlerts(previousVehicles, data.vehicles).catch(err =>
+                    console.error('[Scraper] Car alert error:', err.message)
+                );
             }
         } catch (err) {
             console.error('[Scraper] Hourly refresh error:', err.message);
