@@ -5,7 +5,7 @@ require('dotenv').config();
 if (!process.env.GEMINI_API_KEY) {
     console.error('❌ CRITICAL: GEMINI_API_KEY is missing!');
 } else {
-    console.log('✅ Gemini API Key loaded. Model: gemini-2.0-flash');
+    console.log('✅ Gemini API Key loaded. Model: gemini-2.5-flash');
 }
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
@@ -46,7 +46,7 @@ MEMORY RULES (read chat history before every reply):
         for (const msg of rawHistory) {
             const role = msg.role === 'Nazim' ? 'model' : 'user';
             if (geminiHistory.length > 0 && geminiHistory[geminiHistory.length - 1].role === role) {
-                // Merge consecutive same-role turns (Gemini doesn't allow them back-to-back)
+                // Merge consecutive same-role turns
                 geminiHistory[geminiHistory.length - 1].parts[0].text += '\n' + msg.content;
             } else {
                 geminiHistory.push({ role, parts: [{ text: msg.content }] });
@@ -63,9 +63,9 @@ MEMORY RULES (read chat history before every reply):
             geminiHistory.pop();
         }
 
-        // ── SEND TO GEMINI ──────────────────────────────────────
+        // ── SEND TO GEMINI 2.5 FLASH ────────────────────────────
         const model = genAI.getGenerativeModel({
-            model: 'gemini-2.0-flash',
+            model: 'gemini-2.5-flash',
             systemInstruction: systemPrompt,
         });
 
@@ -79,8 +79,8 @@ MEMORY RULES (read chat history before every reply):
             },
         });
 
-        // Retry on 429 / 503 with exponential backoff
-        const retryDelays = [10000, 20000, 30000, 45000, 60000, 90000];
+        // Retry on 429 / 503 — shorter delays since 2.5-flash has higher limits
+        const retryDelays = [5000, 10000, 20000, 30000];
         for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
             try {
                 const result = await chat.sendMessage(messageBody);
@@ -91,11 +91,10 @@ MEMORY RULES (read chat history before every reply):
                 const is503 = msg.includes('503');
 
                 if ((is429 || is503) && attempt < retryDelays.length) {
-                    const waitMs = is503 ? 5000 : retryDelays[attempt];
+                    const waitMs = is503 ? 3000 : retryDelays[attempt];
                     console.error(`Gemini ${is429 ? '429 Rate Limit' : '503 Overloaded'}. Waiting ${waitMs / 1000}s (retry ${attempt + 1}/${retryDelays.length})...`);
                     await new Promise(r => setTimeout(r, waitMs));
                 } else {
-                    // Non-retryable error or retries exhausted
                     throw error;
                 }
             }
@@ -103,14 +102,8 @@ MEMORY RULES (read chat history before every reply):
 
     } catch (error) {
         console.error('❌ Gemini Fatal Error:', error.message);
-        // Natural-sounding fallbacks for when AI is unavailable
-        const fallbacks = [
-            "Hey sorry, give me just a minute 🙏",
-            "My bad, bit tied up — will reply shortly!",
-            "Sorry, just stepped away — back in a sec!",
-            "One moment, checking on that for you!"
-        ];
-        return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+        // Throw so the caller (index.js) can handle the fallback with proper logging
+        throw error;
     }
 }
 

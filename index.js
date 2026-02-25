@@ -40,17 +40,25 @@ function isDuplicate(msgId) {
 }
 
 // ============================================================
-// SERIAL MESSAGE QUEUE — ensures only ONE Gemini call at a time.
-// Prevents 429 rate limits when multiple users message simultaneously.
+// PER-USER MESSAGE QUEUES — each customer has their own queue.
+// One stuck customer (e.g. 429 retries) won't block others.
+// gemini-2.5-flash has higher rate limits → 3s gap is safe.
 // ============================================================
-let messageQueue = Promise.resolve();
-const GEMINI_CALL_INTERVAL_MS = 8000; // gemini-2.0-flash = 10 RPM limit → 8s gap = safe 7.5/min
+const userQueues = new Map(); // userId → Promise
+const GEMINI_CALL_INTERVAL_MS = 3000; // 2.5-flash higher RPM → 3s gap ≈ 20/min
 let lastGeminiCallTime = 0;
+const QUEUE_TIMEOUT_MS = 3 * 60 * 1000; // drop messages waiting > 3 min
 
-function enqueueMessage(handler) {
-    messageQueue = messageQueue
+function enqueueMessage(userId, handler) {
+    const prev = userQueues.get(userId) || Promise.resolve();
+    const next = prev
         .then(() => handler())
-        .catch(err => console.error('[Queue] Handler error:', err.message));
+        .catch(err => console.error(`[Queue:${userId}] Handler error:`, err.message));
+    userQueues.set(userId, next);
+    // Clean up map entry once queue for this user is done
+    next.finally(() => {
+        if (userQueues.get(userId) === next) userQueues.delete(userId);
+    });
 }
 
 async function waitForGeminiSlot() {
@@ -305,8 +313,15 @@ client.on('message', async (message) => {
 
     const userId = message.from;
 
-    // ── QUEUE: process one message at a time ───────────────
-    enqueueMessage(async () => {
+    // ── QUEUE: per-user queue, process one per user at a time ─
+    const enqueuedAt = Date.now();
+    enqueueMessage(userId, async () => {
+        // Drop stale messages that waited too long in queue
+        if (Date.now() - enqueuedAt > QUEUE_TIMEOUT_MS) {
+            console.warn(`[Queue] ⏱ Stale message from ${userId} dropped (waited > 3min)`);
+            return;
+        }
+
         if (isHandedOff(userId)) {
             console.log(`[Handoff] AI paused for ${userId}, skipping.`);
             return;
@@ -389,7 +404,18 @@ client.on('message', async (message) => {
             await waitForGeminiSlot();
 
             // Get AI response
-            const response = await getAIResponse(userId, body, userState);
+            let response;
+            try {
+                response = await getAIResponse(userId, body, userState);
+            } catch (aiErr) {
+                // AI permanently failed — send honest fallback and log for manual follow-up
+                console.error(`[MISSED] ⚠️ AI failed for ${name} (${phone}): ${aiErr.message}`);
+                console.error(`[MISSED] ⚠️ Manual follow-up needed for: ${name} (${phone})`);
+                await client.sendMessage(userId,
+                    'Sorry for the delay! Our team will get back to you shortly 🙏'
+                );
+                return;
+            }
 
             if (userState.step === 0) {
                 userState.step = 1;
