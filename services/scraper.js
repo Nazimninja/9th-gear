@@ -15,13 +15,11 @@ const cheerio = require('cheerio');
 const INVENTORY_URL = 'https://www.9thgear.co.in/luxury-used-cars-bangalore';
 
 // Full browser-like headers to avoid 406 / bot-block responses
-// NOTE: Accept-Encoding is intentionally omitted (or set to identity) so that
-// axios receives plain text, not gzip binary — which cheerio can't parse on Railway.
 const BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-IN,en;q=0.9',
-    'Accept-Encoding': 'identity',   // plain text only — no gzip that cheerio can't decode
+    'Accept-Encoding': 'gzip, deflate, br',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
     'Referer': 'https://www.9thgear.co.in/',
@@ -40,84 +38,58 @@ let lastScrapeTime = 0;
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 /**
- * Parse the 9thgear inventory page HTML into a structured array.
+ * Parse the 9thgear inventory listing page HTML into a structured array.
+ * Skips cars with `carstatus` class on their image (= sold / unavailable).
  *
- * Actual page structure (confirmed from live HTML):
- *
- *   <div class="main-car">
- *     <div>
- *       <a href="/luxury-used-cars/model-name/ID/">
- *         <img class="car-image [carstatus]">   ← carstatus = SOLD, skip it
- *       </a>
- *     </div>
- *     <div class="car-text">
- *       <div class="row">
- *         <span class="type">Hot Deal</span>
- *         <span class="comment">2020</span>      ← year
- *       </div>
- *       <h3><a href="...">MODEL NAME</a></h3>
- *       <span class="carbg">KA 09</span>         ← registration
- *       <span class="carbg">Diesel</span>         ← fuel
- *       <span class="carbg">97399 km</span>       ← mileage
- *       <span class="posted_by">₹ 29,75,000</span>
- *     </div>
- *   </div>
+ * Real page structure (flat siblings inside each car block):
+ *   <a href="/luxury-used-cars/slug/ID/"><img class="car-image [carstatus]"></a>
+ *   <span class="posted_by">₹ 29,75,000</span>   ← SIBLING of <a>, not inside it
+ *   <h3><a href="..." class="hover-underline-animation left">MODEL NAME</a></h3>
+ *   <span class="carbg">...</span>  ← registration (KA 09)
+ *   <span class="carbg">...</span>  ← fuel type (Diesel/Petrol/EV)
+ *   <span class="carbg">...</span>  ← mileage (97399 km)
  */
 function parseInventory(html) {
     const $ = cheerio.load(html);
     const vehicles = [];
 
-    // Iterate over each car card — .main-car is the container for ONE listing
-    $('div.main-car').each((i, card) => {
+    // Find every car image link — each is the anchor point for one car listing
+    $('a img.car-image').each((i, imgEl) => {
         try {
-            // Check for sold status — img inside the card has class "carstatus"
-            const imgEl = $(card).find('img.car-image');
-            if (!imgEl.length) return; // no image → not a car card
+            const imgClass = $(imgEl).attr('class') || '';
 
-            const imgClass = imgEl.attr('class') || '';
-            if (imgClass.includes('carstatus')) return; // SOLD — skip
+            // `carstatus` class = car is SOLD — always skip these
+            if (imgClass.includes('carstatus')) return;
 
-            // URL from the <a> wrapping the image
-            const carUrl = $(card).find('img.car-image').parent('a').attr('href') || '';
-            if (!carUrl.includes('/luxury-used-cars/')) return;
-            const fullUrl = carUrl.startsWith('http')
-                ? carUrl
-                : `https://www.9thgear.co.in${carUrl}`;
+            const carLinkEl = $(imgEl).parent(); // the <a> tag
+            const url = carLinkEl.attr('href') || '';
+            if (!url.includes('/luxury-used-cars/')) return;
 
-            // Details are all inside div.car-text
-            const carText = $(card).find('div.car-text');
+            const fullUrl = url.startsWith('http') ? url : `https://www.9thgear.co.in${url}`;
 
-            // Model name: <h3><a ...>MODEL NAME</a></h3>
-            const model = carText.find('h3 a').first().text().trim();
+            // Price is the <span class="posted_by"> immediately after the <a> tag
+            const priceRaw = carLinkEl.next('span.posted_by').text().trim();
+            const priceNum = priceRaw.replace(/[^\d,]/g, '').trim();
+            const price = priceNum ? `₹ ${priceNum}` : 'Contact for price';
+
+            // Model name is in the next <h3> after the price span
+            const model = carLinkEl.nextAll('h3').first().find('a').first().text().trim();
             if (!model) return;
 
-            // Year: <span class="comment">2020</span>
-            const year = carText.find('span.comment').first().text().trim();
+            // Details: span.carbg siblings after the <a> — reg, fuel, km
+            const carbgEls = carLinkEl.nextAll('span.carbg');
+            const details = carbgEls.map((_, el) => $(el).text().trim()).get()
+                .filter(Boolean)
+                .join(', ');
 
-            // Detail spans: reg / fuel / km  (3 × span.carbg)
-            const carbgTexts = carText.find('span.carbg')
-                .map((_, el) => $(el).text().replace(/\s+/g, ' ').trim())
-                .get()
-                .filter(Boolean);
-            const details = carbgTexts.join(' · ');
-
-            // Price: <span class="posted_by">₹ 29,75,000</span>
-            // The ₹ symbol sometimes renders as '?' in encoded responses — normalise it
-            const priceRaw = carText.find('span.posted_by').first().text()
-                .replace(/\?/g, '₹')   // fix encoding artefact
-                .replace(/Rs\.?/gi, '₹')
-                .trim();
-            const price = priceRaw || 'Contact for price';
-
-            vehicles.push({ model, year, price, details, url: fullUrl });
+            vehicles.push({ model, price, details, url: fullUrl });
         } catch (_) {
-            // Silently skip malformed entries
+            // Skip malformed entries silently
         }
     });
 
     return vehicles;
 }
-
 
 /**
  * Try to extract a year from the URL slug (not always present, best-effort).

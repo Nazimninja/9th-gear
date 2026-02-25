@@ -13,16 +13,11 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
 function buildInventoryText() {
     if (!businessInfo.vehicles || businessInfo.vehicles.length === 0) {
-        return `[INVENTORY UNAVAILABLE RIGHT NOW]
-CRITICAL: If the customer asks about specific cars or availability, you MUST say:
-"I'm having a bit of trouble pulling up our live inventory right now. Please check our website for the latest listings: https://www.9thgear.co.in/luxury-used-cars-bangalore — or I can have our team call you directly! 😊"
-Do NOT say you are checking, coordinating, or will get back to them. Give the website link and offer a callback.`;
+        return '(Inventory loading — tell customer you will check and confirm)';
     }
-    return businessInfo.vehicles.map(v => {
-        const year = v.year ? ` ${v.year}` : '';
-        const details = v.details ? ` | ${v.details}` : '';
-        return `- ${v.model}${year}: ${v.price}${details} | ${v.url}`;
-    }).join('\n');
+    return businessInfo.vehicles.map(v =>
+        `- ${v.model} (${v.year}): ${v.price} | ${v.details} | More info: ${v.url}`
+    ).join('\n');
 }
 
 async function getAIResponse(userId, messageBody, userState) {

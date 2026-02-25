@@ -149,18 +149,24 @@ async function runFollowUpCheck() {
  *
  * @param {Array} previousVehicles  - Inventory before this scrape
  * @param {Array} newVehicles       - Inventory after this scrape
+ * @param {Boolean} forceAlert      - If true, treat all newVehicles as "new"
  */
-async function sendCarAlerts(previousVehicles, newVehicles) {
+async function sendCarAlerts(previousVehicles, newVehicles, forceAlert = false) {
     try {
-        // Find cars that are in the new list but were NOT in the previous list
-        const prevUrls = new Set((previousVehicles || []).map(v => v.url));
-        const newCars = (newVehicles || []).filter(v => v.url && !prevUrls.has(v.url));
+        let newCars = [];
+        if (forceAlert) {
+            newCars = newVehicles || [];
+        } else {
+            // Find cars that are in the new list but were NOT in the previous list
+            const prevUrls = new Set((previousVehicles || []).map(v => v.url));
+            newCars = (newVehicles || []).filter(v => v.url && !prevUrls.has(v.url));
+        }
 
         if (newCars.length === 0) {
             return; // No new listings this cycle
         }
 
-        console.log(`[CarAlert] 🆕 ${newCars.length} new car(s) detected: ${newCars.map(c => c.model).join(', ')}`);
+        console.log(`[CarAlert] 🆕 ${newCars.length} car(s) detected for alerting (forceAlert=${forceAlert})`);
 
         // Read all leads that are still active (could be interested)
         const leads = await getLeadsForFollowUp();
@@ -177,7 +183,7 @@ async function sendCarAlerts(previousVehicles, newVehicles) {
 
             for (const lead of activeleads) {
                 // Check if this car was already alerted to this lead
-                const alreadyAlerted = (lead.carAlertsLog || '').toUpperCase().includes(car.model.toUpperCase());
+                const alreadyAlerted = (lead.carAlertsLog || '').toUpperCase().includes(carModelUpper);
                 if (alreadyAlerted) continue;
 
                 // Fuzzy match: check if any keyword from the lead's requirement
@@ -189,7 +195,7 @@ async function sendCarAlerts(previousVehicles, newVehicles) {
                         console.log(`[CarAlert] ✅ Sent alert to ${lead.name} (${lead.phone}) for ${car.model}`);
                         alertsSent++;
                         // Small delay to avoid flooding WhatsApp
-                        await new Promise(r => setTimeout(r, 3000));
+                        await new Promise(r => setTimeout(r, 2000));
                     }
                 }
             }
@@ -217,7 +223,30 @@ function requirementMatchesCar(requirement, carModelUpper) {
 
     const req = requirement.toUpperCase();
 
-    // Extract meaningful tokens (min 2 chars, skip common words)
+    // Specific model extraction (prioritize these)
+    const specificModels = ['GLA', 'GLC', 'GLE', 'GLS', 'X1', 'X3', 'X5', 'X7', 'Q3', 'Q5', 'Q7', 'A3', 'A4', 'A6', 'A8', '520D', '320D', 'DEFENDER', 'EVOQUE', 'VELAR', 'DISCOVERY'];
+    for (const model of specificModels) {
+        if (req.includes(model) && carModelUpper.includes(model)) return true;
+    }
+
+    // Brands
+    const brands = ['MERCEDES', 'BMW', 'AUDI', 'LAND ROVER', 'JAGUAR', 'VOLVO', 'PORSCHE', 'MINI', 'COOPER'];
+    for (const brand of brands) {
+        if (req.includes(brand) && carModelUpper.includes(brand)) {
+            // If they only say "BMW", we probably match many things. 
+            // Let's refine: if they say "BMW" and something else, check if the "something else" matches too.
+            const remaining = req.replace(brand, '').trim();
+            if (!remaining) return true; // Just "BMW" requirement
+
+            const words = remaining.split(/\s+/).filter(w => w.length >= 2);
+            if (words.length === 0) return true;
+
+            // Check if any of the other words match
+            if (words.some(word => carModelUpper.includes(word))) return true;
+        }
+    }
+
+    // Generic keywords extraction
     const skipWords = new Set(['A', 'AN', 'THE', 'OR', 'AND', 'FOR', 'UNDER', 'OVER', 'WITH',
         'IN', 'AT', 'TO', 'OF', 'LOOKING', 'WANT', 'NEED', 'BUY', 'CAR', 'USED',
         'LUXURY', 'SECOND', 'HAND', 'PRE', 'OWNED', 'BUDGET', 'AROUND', 'APPROX']);
@@ -227,8 +256,26 @@ function requirementMatchesCar(requirement, carModelUpper) {
         .split(/\s+/)
         .filter(t => t.length >= 2 && !skipWords.has(t) && !/^\d+L?$/.test(t));
 
-    // A match requires at least one token to appear in the car model
-    return tokens.some(token => carModelUpper.includes(token));
+    // If we have specific tokens, check if at least ONE matches
+    if (tokens.length > 0) {
+        return tokens.some(token => carModelUpper.includes(token));
+    }
+
+    return false;
+}
+
+/**
+ * Forced test for car alerts. Pretends all cars in current inventory are NEW
+ * and alerts matching leads who haven't received them yet.
+ */
+async function runManualAlertTest(businessInfo) {
+    console.log('[CarAlert] 🧪 Starting manual alert test...');
+    if (!businessInfo || !businessInfo.vehicles || businessInfo.vehicles.length === 0) {
+        console.warn('[CarAlert] No vehicles in inventory to test with.');
+        return;
+    }
+    // We pass true for forceAlert
+    await sendCarAlerts([], businessInfo.vehicles, true);
 }
 
 // ─── SCHEDULER ───────────────────────────────────────────────────────────────
@@ -262,5 +309,6 @@ function startFollowUpScheduler(client) {
 module.exports = {
     runFollowUpCheck,
     sendCarAlerts,
+    runManualAlertTest,
     startFollowUpScheduler,
 };

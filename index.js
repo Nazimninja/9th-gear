@@ -6,8 +6,8 @@ const path = require('path');
 const { getAIResponse } = require('./services/ai');
 const { appendToSheet, updateRequirement, updateLocation, initLeadsHeaders, updateLastActive } = require('./services/sheets');
 const { scrapeBusinessData, startInventoryRefresh } = require('./services/scraper');
-const { logConversation, startLearningScheduler } = require('./services/learningEngine');
-const { startFollowUpScheduler } = require('./services/followUpEngine');
+const { startLearningScheduler, logConversation } = require('./services/learningEngine');
+const { startFollowUpScheduler, runFollowUpCheck, runManualAlertTest } = require('./services/followUpEngine');
 const {
     getOrInitState,
     updateState,
@@ -329,6 +329,26 @@ client.on('message', async (message) => {
     if (!body) return; // skip media-only messages
 
     const userId = message.from;
+
+    // ── ADMIN COMMANDS (owner only, bypasses queue) ────────────
+    const OWNER_NUMBER = '918147757479';
+    const senderPhone = userId.replace(/@.*$/, '').replace(/\D/g, '');
+    if (senderPhone === OWNER_NUMBER) {
+        if (body === '!followup') {
+            console.log('[Admin] 🧪 Manual follow-up check triggered by owner');
+            await client.sendMessage(userId, '⏳ Running follow-up check now...');
+            await runFollowUpCheck();
+            await client.sendMessage(userId, '✅ Follow-up check complete! Check Railway logs for details.');
+            return;
+        }
+        if (body === '!alert-test') {
+            console.log('[Admin] 🧪 Manual car alert test triggered by owner');
+            await client.sendMessage(userId, '⏳ Running car alert test (treating all inventory as new)...');
+            await runManualAlertTest(businessInfo);
+            await client.sendMessage(userId, '✅ Car alert test complete! Check Railway logs for details.');
+            return;
+        }
+    }
 
     // ── QUEUE: per-user queue, process one per user at a time ─
     const enqueuedAt = Date.now();
