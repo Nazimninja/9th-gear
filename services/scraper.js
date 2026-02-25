@@ -41,48 +41,59 @@ const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
  * Parse the 9thgear inventory listing page HTML into a structured array.
  * Skips cars with `carstatus` class on their image (= sold / unavailable).
  *
- * Real page structure (flat siblings inside each car block):
- *   <a href="/luxury-used-cars/slug/ID/"><img class="car-image [carstatus]"></a>
- *   <span class="posted_by">₹ 29,75,000</span>   ← SIBLING of <a>, not inside it
- *   <h3><a href="..." class="hover-underline-animation left">MODEL NAME</a></h3>
- *   <span class="carbg">...</span>  ← registration (KA 09)
- *   <span class="carbg">...</span>  ← fuel type (Diesel/Petrol/EV)
- *   <span class="carbg">...</span>  ← mileage (97399 km)
+ * Updated page structure (as of Feb 2026):
+ *   <div class="main-car">
+ *     <div>
+ *       <a href="..."><img class="car-image [carstatus]"></a>
+ *     </div>
+ *     <div class="car-text">
+ *       <h3><a href="..." class="hover-underline-animation left">MODEL NAME</a></h3>
+ *       <span class="carbg">KA 09</span>       ← registration
+ *       <span class="carbg">Diesel</span>      ← fuel type
+ *       <span class="carbg">97399 km</span>    ← mileage
+ *       <span class="posted_by">₹ 29,75,000</span>
+ *     </div>
+ *   </div>
  */
 function parseInventory(html) {
     const $ = cheerio.load(html);
     const vehicles = [];
 
-    // Find every car image link — each is the anchor point for one car listing
-    $('a img.car-image').each((i, imgEl) => {
+    // Each car is inside a div.main-car block
+    $('div.main-car').each((i, carEl) => {
         try {
-            const imgClass = $(imgEl).attr('class') || '';
+            // Check sold status via img class inside this block
+            const imgEl = $(carEl).find('img.car-image');
+            const imgClass = imgEl.attr('class') || '';
+            if (imgClass.includes('carstatus')) return; // SOLD — skip
 
-            // `carstatus` class = car is SOLD — always skip these
-            if (imgClass.includes('carstatus')) return;
-
-            const carLinkEl = $(imgEl).parent(); // the <a> tag
-            const url = carLinkEl.attr('href') || '';
-            if (!url.includes('/luxury-used-cars/')) return;
-
+            // Get the car URL from the <a> wrapping the image
+            const carLink = $(carEl).find('a[href*="/luxury-used-cars/"]').first();
+            const url = carLink.attr('href') || '';
+            if (!url) return;
             const fullUrl = url.startsWith('http') ? url : `https://www.9thgear.co.in${url}`;
 
-            // Price is the <span class="posted_by"> immediately after the <a> tag
-            const priceRaw = carLinkEl.next('span.posted_by').text().trim();
+            // All text info is inside div.car-text
+            const textDiv = $(carEl).find('div.car-text');
+
+            // Model name: h3 > a
+            const model = textDiv.find('h3 a').first().text().trim();
+            if (!model) return;
+
+            // Price: span.posted_by inside car-text
+            const priceRaw = textDiv.find('span.posted_by').text().trim();
             const priceNum = priceRaw.replace(/[^\d,]/g, '').trim();
             const price = priceNum ? `₹ ${priceNum}` : 'Contact for price';
 
-            // Model name is in the next <h3> after the price span
-            const model = carLinkEl.nextAll('h3').first().find('a').first().text().trim();
-            if (!model) return;
+            // Details: all span.carbg — reg, fuel type, mileage
+            const details = textDiv.find('span.carbg').map((_, el) =>
+                $(el).text().replace(/\s+/g, ' ').trim()
+            ).get().filter(Boolean).join(', ');
 
-            // Details: span.carbg siblings after the <a> — reg, fuel, km
-            const carbgEls = carLinkEl.nextAll('span.carbg');
-            const details = carbgEls.map((_, el) => $(el).text().trim()).get()
-                .filter(Boolean)
-                .join(', ');
+            // Year from span.comment (inside the row div)
+            const year = textDiv.find('span.comment').text().trim();
 
-            vehicles.push({ model, price, details, url: fullUrl });
+            vehicles.push({ model, price, details, year, url: fullUrl });
         } catch (_) {
             // Skip malformed entries silently
         }
