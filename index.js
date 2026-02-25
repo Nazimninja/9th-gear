@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { getAIResponse } = require('./services/ai');
 const { appendToSheet, updateRequirement, updateLocation } = require('./services/sheets');
-const { scrapeBusinessData } = require('./services/scraper');
+const { scrapeBusinessData, startInventoryRefresh } = require('./services/scraper');
 const { logConversation, startLearningScheduler } = require('./services/learningEngine');
 const {
     getOrInitState,
@@ -159,18 +159,22 @@ function extractLocation(body) {
 }
 
 // ============================================================
-// SCRAPE INVENTORY ON STARTUP
+// SCRAPE INVENTORY ON STARTUP + SCHEDULE HOURLY REFRESH
 // ============================================================
 (async () => {
     try {
         const scrapedData = await scrapeBusinessData();
         if (scrapedData.vehicles.length > 0) {
             businessInfo.vehicles = scrapedData.vehicles;
-            console.log(`[Scraper] Loaded ${scrapedData.vehicles.length} vehicles.`);
+            console.log(`[Scraper] Loaded ${scrapedData.vehicles.length} live vehicles (sold cars excluded).`);
+        } else {
+            console.warn('[Scraper] ⚠️ No vehicles parsed on startup — check site structure or network.');
         }
     } catch (e) {
         console.error('[Scraper] Failed:', e.message);
     }
+    // Refresh inventory every hour so sold cars are removed promptly
+    startInventoryRefresh(businessInfo);
 })();
 
 // ============================================================
