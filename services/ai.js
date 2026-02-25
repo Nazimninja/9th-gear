@@ -13,10 +13,10 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
 function buildInventoryText() {
     if (!businessInfo.vehicles || businessInfo.vehicles.length === 0) {
-        return '(Inventory loading — tell customer you will check and confirm)';
+        return '(No inventory data yet — if asked about specific cars, say you will check and send details shortly. Do NOT keep stalling on the same car repeatedly.)';
     }
     return businessInfo.vehicles.map(v =>
-        `- ${v.model} (${v.year}): ${v.price} | ${v.details} | More info: ${v.url}`
+        `- ${v.model} (${v.year || ''}): ${v.price} | ${v.details} | More info: ${v.url}`
     ).join('\n');
 }
 
@@ -33,6 +33,11 @@ async function getAIResponse(userId, messageBody, userState) {
             ? `\n━━━━━━━━━━━━━━━━━━━━━━━\nCOACHING TIPS FROM EXPERIENCE (learned from real past conversations — follow these):\n━━━━━━━━━━━━━━━━━━━━━━━\n${learningTips}\n`
             : '';
 
+        // Check if bot has already spoken before in this conversation
+        const hasPriorBotMessage = (userState.history || []).some(
+            m => m.role === 'Nazim' && m.content && m.content.trim()
+        );
+
         const systemPrompt = `${businessInfo.systemPrompt}${learningSection}
 CURRENT INVENTORY (use ONLY this — do NOT make up cars):
 ${buildInventoryText()}
@@ -42,6 +47,7 @@ MEMORY RULES (read chat history before every reply):
 - Do NOT reintroduce yourself if already done.
 - Use the customer's name if known. Don't ask for it again.
 - Remember their car preference and city — never ask twice.
+${hasPriorBotMessage ? '\nCRITICAL: This is NOT the first message. You have ALREADY introduced yourself. Go straight into helping — no intro, no "Hey there, this is Nazim" etc.' : '\nThis IS the first message. Give a brief, warm intro and ask what they are looking for.'}
 `;
 
         // ── BUILD CHAT HISTORY ──────────────────────────────────
@@ -59,9 +65,10 @@ MEMORY RULES (read chat history before every reply):
             }
         }
 
-        // Must start with user turn
-        while (geminiHistory.length > 0 && geminiHistory[0].role !== 'user') {
-            geminiHistory.shift();
+        // Must start with user turn — if history begins with a bot message,
+        // prepend a synthetic user opener so context is NOT lost
+        if (geminiHistory.length > 0 && geminiHistory[0].role !== 'user') {
+            geminiHistory.unshift({ role: 'user', parts: [{ text: '(conversation started)' }] });
         }
 
         // Remove last user turn — we send it as the live message below
@@ -79,7 +86,7 @@ MEMORY RULES (read chat history before every reply):
             history: geminiHistory,
             generationConfig: {
                 temperature: 0.9,
-                maxOutputTokens: 300,
+                maxOutputTokens: 500,
                 topP: 0.95,
                 topK: 40,
             },

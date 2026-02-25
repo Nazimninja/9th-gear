@@ -373,6 +373,10 @@ async function appendConversationLog({ date, name, phone, summary, outcome }) {
         });
         console.log(`[Sheets] ✅ ConvoLog: ${name} (${outcome})`);
     } catch (err) {
+        if (err.message && err.message.includes('Unable to parse range')) {
+            console.warn('[Sheets] ConvoLog tab not found — create a tab named "ConvoLog" in your Google Sheet.');
+            return;
+        }
         console.error('[Sheets] appendConversationLog error:', err.message);
     }
 }
@@ -392,6 +396,10 @@ async function appendLearningTip({ date, tip }) {
             resource: { values: [[date, tip]] }
         });
     } catch (err) {
+        if (err.message && err.message.includes('Unable to parse range')) {
+            console.warn('[Sheets] Learning tab not found — create a tab named "Learning" in your Google Sheet.');
+            return;
+        }
         console.error('[Sheets] appendLearningTip error:', err.message);
     }
 }
@@ -425,7 +433,7 @@ async function getConversationLogs(limit = 30) {
 
 // ============================================================
 // GET LEARNING TIPS — read all tips from Learning tab
-// Returns array of tip strings
+// Returns array of tip strings (empty if tab doesn't exist yet)
 // ============================================================
 async function getLearningTipsFromSheet() {
     try {
@@ -438,6 +446,10 @@ async function getLearningTipsFromSheet() {
         const rows = (res.data.values || []).filter(r => r[1] && r[1].trim().length > 5);
         return rows.map(r => r[1].trim()); // column B = tip text
     } catch (err) {
+        // If the Learning tab doesn't exist yet, quietly return empty (not an error)
+        if (err.message && (err.message.includes('Unable to parse range') || err.message.includes('not found'))) {
+            return []; // Tab not created yet — will be created when first tip is saved
+        }
         console.error('[Sheets] getLearningTipsFromSheet error:', err.message);
         return [];
     }
